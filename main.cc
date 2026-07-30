@@ -77,7 +77,15 @@ int main(int argc, char* argv[]) {
     client->async_connect(host, port);
 
     std::thread io_thread([&io]() {
-        io.run();
+        try {
+            io.run();
+        }
+        catch (const std::exception& e) {
+            std::cerr << "io_context exception: " << e.what() << std::endl;
+        }
+        catch (...) {
+            std::cerr << "io_context unknown exception" << std::endl;
+        }
     });
 
     while (!g_should_exit) {
