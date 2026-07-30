@@ -14,6 +14,7 @@ A lightweight, header-only MQTT v3.1.1 client library written in C++14, powered 
   - PINGREQ / PINGRESP
   - DISCONNECT
 - Built-in Keep-Alive mechanism with timeout detection
+- Username/Password authentication support
 - Variable-length encoding/decoding for Remaining Length
 - Small, dependency-light footprint
 
@@ -66,6 +67,16 @@ The demo client connects to a local broker, subscribes to a topic and publishes 
                --payload "Hello from LiteMQTT!"
 ```
 
+With authentication:
+
+```bash
+./LiteMQTTDemo --host 127.0.0.1 --port 1883 \
+               --username myuser --password mypass \
+               --subscribe litemqtt/demo \
+               --publish litemqtt/demo \
+               --payload "Hello from LiteMQTT!"
+```
+
 Press Ctrl-C to disconnect and exit.
 
 ## Usage Example
@@ -81,6 +92,8 @@ int main() {
     client->set_client_id("my_client");
     client->set_keep_alive(60);
     client->set_clean_session(true);
+    client->set_username("myuser");
+    client->set_password("mypass");
 
     client->on_connect([client](bool ok, uint8_t rc) {
         if (ok) {
