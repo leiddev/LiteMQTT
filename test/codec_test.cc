@@ -63,34 +63,42 @@ TEST(BufferWriterTest, WriteEmptyString) {
 
 TEST(BufferWriterTest, RemainingLengthBoundary) {
     std::vector<uint8_t> buf;
+    std::vector<uint8_t> expected;
 
     buf.clear();
+    expected = {0x00};
     buffer_writer(buf).write_remaining_length(0);
-    EXPECT_EQ(buf, std::vector<uint8_t>{0x00});
+    EXPECT_EQ(buf, expected);
 
     buf.clear();
+    expected = {0x7F};
     buffer_writer(buf).write_remaining_length(127);
-    EXPECT_EQ(buf, std::vector<uint8_t>{0x7F});
+    EXPECT_EQ(buf, expected);
 
     buf.clear();
+    expected = {0x80, 0x01};
     buffer_writer(buf).write_remaining_length(128);
-    EXPECT_EQ(buf, std::vector<uint8_t>{0x80, 0x01});
+    EXPECT_EQ(buf, expected);
 
     buf.clear();
+    expected = {0xFF, 0x7F};
     buffer_writer(buf).write_remaining_length(16383);
-    EXPECT_EQ(buf, std::vector<uint8_t>{0xFF, 0x7F});
+    EXPECT_EQ(buf, expected);
 
     buf.clear();
+    expected = {0x80, 0x80, 0x01};
     buffer_writer(buf).write_remaining_length(16384);
-    EXPECT_EQ(buf, std::vector<uint8_t>{0x80, 0x80, 0x01});
+    EXPECT_EQ(buf, expected);
 
     buf.clear();
+    expected = {0x80, 0x80, 0x80, 0x01};
     buffer_writer(buf).write_remaining_length(2097152);
-    EXPECT_EQ(buf, std::vector<uint8_t>{0x80, 0x80, 0x80, 0x01});
+    EXPECT_EQ(buf, expected);
 
     buf.clear();
+    expected = {0xFF, 0xFF, 0xFF, 0x7F};
     buffer_writer(buf).write_remaining_length(268435455);
-    EXPECT_EQ(buf, std::vector<uint8_t>{0xFF, 0xFF, 0xFF, 0x7F});
+    EXPECT_EQ(buf, expected);
 }
 
 TEST(BufferReaderTest, ReadUint8) {
