@@ -230,6 +230,8 @@ TEST(ConnackPacketTest, SerializeAndParse) {
 
 TEST(PublishPacketTest, SerializeAndParse) {
     publish_packet pkt;
+    pkt.packet_id = 1;
+    pkt.qos = 1;
     pkt.topic_name = "test/topic";
     pkt.payload = "Hello, MQTT!";
 
@@ -237,8 +239,25 @@ TEST(PublishPacketTest, SerializeAndParse) {
     EXPECT_GE(data.size(), 16);
 
     publish_packet parsed = publish_packet::parse(data);
+    EXPECT_EQ(parsed.packet_id, 1);
+    EXPECT_EQ(parsed.qos, 1);
     EXPECT_EQ(parsed.topic_name, "test/topic");
     EXPECT_EQ(parsed.payload, "Hello, MQTT!");
+}
+
+TEST(PublishPacketTest, QoS0NoPacketId) {
+    publish_packet pkt;
+    pkt.qos = 0;
+    pkt.topic_name = "test/topic";
+    pkt.payload = "Hello";
+
+    std::vector<uint8_t> data = pkt.serialize();
+    EXPECT_GE(data.size(), 7);
+
+    publish_packet parsed = publish_packet::parse(data);
+    EXPECT_EQ(parsed.qos, 0);
+    EXPECT_EQ(parsed.topic_name, "test/topic");
+    EXPECT_EQ(parsed.payload, "Hello");
 }
 
 TEST(SubscribePacketTest, Serialize) {

@@ -129,6 +129,8 @@ struct connack_packet {
 };
 
 struct publish_packet {
+    uint16_t packet_id;
+    uint8_t qos;
     std::string topic_name;
     std::string payload;
 
@@ -138,12 +140,16 @@ struct publish_packet {
 
         buffer_writer variable_header;
         variable_header.write_string(topic_name);
+        if (qos > 0) {
+            variable_header.write_uint16(packet_id);
+        }
         variable_header.write_bytes(
             reinterpret_cast<const uint8_t*>(payload.data()),
             payload.size()
         );
 
-        writer.write_uint8(to_uint8(packet_type::publish) << 4);
+        uint8_t flags = (qos & 0x03) << 1;
+        writer.write_uint8((to_uint8(packet_type::publish) << 4) | flags);
         writer.write_remaining_length(variable_header.size());
         writer.write_bytes(variable_header.data(), variable_header.size());
 
@@ -160,7 +166,11 @@ struct publish_packet {
         reader.read_remaining_length(remaining_len);
 
         publish_packet pkt;
+        pkt.qos = (packet_type_byte >> 1) & 0x03;
         reader.read_string(pkt.topic_name);
+        if (pkt.qos > 0) {
+            reader.read_uint16(pkt.packet_id);
+        }
 
         std::size_t payload_len = reader.remaining();
         if (payload_len > 0) {
@@ -262,6 +272,30 @@ struct unsubscribe_packet {
         writer.write_bytes(variable_header.data(), variable_header.size());
 
         return buf;
+    }
+};
+
+struct puback_packet {
+    uint16_t packet_id;
+
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> buf;
+        buffer_writer writer(buf);
+        writer.write_uint8(to_uint8(packet_type::puback) << 4);
+        writer.write_uint8(2);
+        writer.write_uint16(packet_id);
+        return buf;
+    }
+
+    static puback_packet parse(const std::vector<uint8_t>& data) {
+        buffer_reader reader(data);
+        uint8_t packet_type_byte = 0;
+        reader.read_uint8(packet_type_byte);
+        std::size_t remaining_len = 0;
+        reader.read_remaining_length(remaining_len);
+        puback_packet pkt;
+        reader.read_uint16(pkt.packet_id);
+        return pkt;
     }
 };
 

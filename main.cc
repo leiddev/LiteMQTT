@@ -63,7 +63,7 @@ int main(int argc, char* argv[]) {
         client->set_password(password);
     }
 
-    client->on_connect([client, subscribe_topic, publish_topic, payload](bool success, uint8_t rc) {
+        client->on_connect([client, subscribe_topic, publish_topic, payload](bool success, uint8_t rc) {
         if (!success) {
             std::cerr << "Connection failed, return code: " << static_cast<int>(rc) << std::endl;
             g_should_exit = true;
@@ -71,11 +71,24 @@ int main(int argc, char* argv[]) {
         }
 
         std::cout << "Connected to broker" << std::endl;
-        client->async_subscribe(subscribe_topic);
-        std::cout << "Subscribed to: " << subscribe_topic << std::endl;
 
-        client->async_publish(publish_topic, payload);
-        std::cout << "Published message on: " << publish_topic << std::endl;
+        // Subscribe with callback
+        client->async_subscribe(subscribe_topic, [subscribe_topic](bool success, uint8_t qos) {
+            if (success) {
+                std::cout << "Subscribed to: " << subscribe_topic << " with QoS " << static_cast<int>(qos) << std::endl;
+            } else {
+                std::cerr << "Failed to subscribe to: " << subscribe_topic << std::endl;
+            }
+        });
+
+        // Publish with callback (QoS 1 for delivery confirmation)
+        client->async_publish(publish_topic, payload, 1, [publish_topic](bool success) {
+            if (success) {
+                std::cout << "Published message on: " << publish_topic << std::endl;
+            } else {
+                std::cerr << "Failed to publish on: " << publish_topic << std::endl;
+            }
+        });
     });
 
     client->on_message([](std::string topic, std::string msg) {

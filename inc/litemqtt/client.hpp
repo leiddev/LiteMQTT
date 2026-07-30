@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -19,6 +20,8 @@ namespace litemqtt {
 using connect_cb = std::function<void(bool success, uint8_t return_code)>;
 using message_cb = std::function<void(std::string topic, std::string payload)>;
 using close_cb = std::function<void()>;
+using subscribe_cb = std::function<void(bool success, uint8_t qos_granted)>;
+using publish_cb = std::function<void(bool success)>;
 
 class mqtt_client : public std::enable_shared_from_this<mqtt_client> {
 public:
@@ -35,12 +38,15 @@ public:
                         connect_cb callback = nullptr);
     void async_disconnect();
 
-    void async_publish(const std::string& topic, const std::string& payload);
-    void async_subscribe(const std::string& topic);
+    void async_publish(const std::string& topic, const std::string& payload,
+                       uint8_t qos = 0, publish_cb callback = nullptr);
+    void async_subscribe(const std::string& topic, subscribe_cb callback = nullptr);
 
     void on_connect(connect_cb callback);
     void on_message(message_cb callback);
     void on_close(close_cb callback);
+    void on_subscribe(subscribe_cb callback);
+    void on_publish(publish_cb callback);
 
     connection_state state() const;
 
@@ -49,6 +55,8 @@ private:
     void handle_packet(const std::vector<uint8_t>& data);
     void handle_connack(const std::vector<uint8_t>& data);
     void handle_publish(const std::vector<uint8_t>& data);
+    void handle_suback(const std::vector<uint8_t>& data);
+    void handle_puback(const std::vector<uint8_t>& data);
     void start_read_loop();
     void schedule_pingreq();
     void cancel_ping_timer();
@@ -67,6 +75,11 @@ private:
     connect_cb on_connect_cb_;
     message_cb on_message_cb_;
     close_cb on_close_cb_;
+    subscribe_cb on_subscribe_cb_;
+    publish_cb on_publish_cb_;
+
+    std::map<uint16_t, std::pair<std::string, subscribe_cb>> pending_subscribes_;
+    std::map<uint16_t, publish_cb> pending_publishes_;
 
     std::shared_ptr<asio::steady_timer> ping_timer_;
 };
@@ -151,6 +164,12 @@ inline void mqtt_client::handle_packet(const std::vector<uint8_t>& data) {
         case packet_type::publish:
             handle_publish(data);
             break;
+        case packet_type::suback:
+            handle_suback(data);
+            break;
+        case packet_type::puback:
+            handle_puback(data);
+            break;
         case packet_type::pingresp:
             cancel_ping_timer();
             schedule_pingreq();
@@ -168,6 +187,47 @@ inline void mqtt_client::handle_connack(const std::vector<uint8_t>& data) {
 inline void mqtt_client::handle_publish(const std::vector<uint8_t>& data) {
     publish_packet pkt = publish_packet::parse(data);
     if (on_message_cb_) on_message_cb_(pkt.topic_name, pkt.payload);
+
+    if (pkt.qos == 1) {
+        puback_packet puback;
+        puback.packet_id = pkt.packet_id;
+        auto self = shared_from_this();
+        conn_->async_write_packet(puback.serialize(), [self](const asio::error_code&) {});
+    }
+}
+
+inline void mqtt_client::handle_suback(const std::vector<uint8_t>& data) {
+    suback_packet pkt = suback_packet::parse(data);
+    auto it = pending_subscribes_.find(pkt.packet_id);
+    if (it != pending_subscribes_.end()) {
+        subscribe_cb cb = it->second.second;
+        pending_subscribes_.erase(it);
+        if (cb) {
+            bool success = !pkt.return_codes.empty() && pkt.return_codes[0] != 0x80;
+            uint8_t qos_granted = (!pkt.return_codes.empty() && success) ? pkt.return_codes[0] : 0;
+            cb(success, qos_granted);
+        }
+    }
+    if (on_subscribe_cb_) {
+        bool success = !pkt.return_codes.empty() && pkt.return_codes[0] != 0x80;
+        uint8_t qos_granted = (!pkt.return_codes.empty() && success) ? pkt.return_codes[0] : 0;
+        on_subscribe_cb_(success, qos_granted);
+    }
+}
+
+inline void mqtt_client::handle_puback(const std::vector<uint8_t>& data) {
+    puback_packet pkt = puback_packet::parse(data);
+    auto it = pending_publishes_.find(pkt.packet_id);
+    if (it != pending_publishes_.end()) {
+        publish_cb cb = it->second;
+        pending_publishes_.erase(it);
+        if (cb) {
+            cb(true);
+        }
+    }
+    if (on_publish_cb_) {
+        on_publish_cb_(true);
+    }
 }
 
 inline void mqtt_client::schedule_pingreq() {
@@ -212,23 +272,49 @@ inline void mqtt_client::async_disconnect() {
     });
 }
 
-inline void mqtt_client::async_publish(const std::string& topic, const std::string& payload) {
+inline void mqtt_client::async_publish(const std::string& topic, const std::string& payload,
+                                        uint8_t qos, publish_cb callback) {
     publish_packet pkt;
     pkt.topic_name = topic;
     pkt.payload = payload;
-    conn_->async_write_packet(pkt.serialize(), [](const asio::error_code&) {});
+    pkt.qos = qos;
+    if (qos > 0) {
+        pkt.packet_id = next_packet_id_++;
+        pending_publishes_[pkt.packet_id] = callback;
+    }
+    auto self = shared_from_this();
+    conn_->async_write_packet(pkt.serialize(), [this, self, callback](const asio::error_code& ec) {
+        if (ec && callback) {
+            callback(false);
+        }
+    });
 }
 
-inline void mqtt_client::async_subscribe(const std::string& topic) {
+inline void mqtt_client::async_subscribe(const std::string& topic, subscribe_cb callback) {
     subscribe_packet pkt;
     pkt.packet_id = next_packet_id_++;
     pkt.topic_filters.push_back(std::make_pair(topic, 0));
-    conn_->async_write_packet(pkt.serialize(), [](const asio::error_code&) {});
+    pending_subscribes_[pkt.packet_id] = {topic, callback};
+    auto self = shared_from_this();
+    conn_->async_write_packet(pkt.serialize(), [this, self](const asio::error_code& ec) {
+        if (ec) {
+            if (!pending_subscribes_.empty()) {
+                auto it = pending_subscribes_.find(next_packet_id_ - 1);
+                if (it != pending_subscribes_.end()) {
+                    auto& cb = it->second.second;
+                    if (cb) cb(false, 0);
+                    pending_subscribes_.erase(it);
+                }
+            }
+        }
+    });
 }
 
 inline void mqtt_client::on_connect(connect_cb callback) { on_connect_cb_ = std::move(callback); }
 inline void mqtt_client::on_message(message_cb callback) { on_message_cb_ = std::move(callback); }
 inline void mqtt_client::on_close(close_cb callback) { on_close_cb_ = std::move(callback); }
+inline void mqtt_client::on_subscribe(subscribe_cb callback) { on_subscribe_cb_ = std::move(callback); }
+inline void mqtt_client::on_publish(publish_cb callback) { on_publish_cb_ = std::move(callback); }
 
 inline connection_state mqtt_client::state() const { return conn_->state(); }
 
