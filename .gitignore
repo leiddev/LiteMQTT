@@ -1,6 +1,7 @@
 # Build directories
 /build/
 /out/
+/temp/
 
 # Visual Studio
 *.sln
