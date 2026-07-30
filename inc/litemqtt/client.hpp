@@ -40,7 +40,7 @@ public:
 
     void async_publish(const std::string& topic, const std::string& payload,
                        uint8_t qos = 0, publish_cb callback = nullptr);
-    void async_subscribe(const std::string& topic, subscribe_cb callback = nullptr);
+    void async_subscribe(const std::string& topic, uint8_t qos = 0, subscribe_cb callback = nullptr);
 
     void on_connect(connect_cb callback);
     void on_message(message_cb callback);
@@ -293,10 +293,10 @@ inline void mqtt_client::async_publish(const std::string& topic, const std::stri
     });
 }
 
-inline void mqtt_client::async_subscribe(const std::string& topic, subscribe_cb callback) {
+inline void mqtt_client::async_subscribe(const std::string& topic, uint8_t qos, subscribe_cb callback) {
     subscribe_packet pkt;
     pkt.packet_id = next_packet_id_++;
-    pkt.topic_filters.push_back(std::make_pair(topic, 0));
+    pkt.topic_filters.push_back(std::make_pair(topic, qos));
     pending_subscribes_[pkt.packet_id] = {topic, callback};
     auto self = shared_from_this();
     conn_->async_write_packet(pkt.serialize(), [this, self](const asio::error_code& ec) {

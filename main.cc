@@ -73,7 +73,7 @@ int main(int argc, char* argv[]) {
         std::cout << "Connected to broker" << std::endl;
 
         // Subscribe with callback
-        client->async_subscribe(subscribe_topic, [](bool success, std::string topic, uint8_t qos) {
+        client->async_subscribe(subscribe_topic, 1, [](bool success, std::string topic, uint8_t qos) {
             if (success) {
                 std::cout << "Subscribed to: " << topic << " with QoS " << static_cast<int>(qos) << std::endl;
             } else {
