@@ -89,10 +89,8 @@ inline void mqtt_client::async_connect(const std::string& host, uint16_t port, c
     }
 
     auto self = shared_from_this();
-    std::cerr << "[DEBUG] async_connect called, host=" << host << " port=" << port << std::endl;
     conn_->async_connect(host, port,
         [this, self](const asio::error_code& ec) {
-            std::cerr << "[DEBUG] connection::async_connect callback, ec=" << ec.value() << std::endl;
             if (ec) {
                 std::cerr << "Socket connect failed: " << ec.message() << std::endl;
                 if (on_connect_cb_) on_connect_cb_(false, 255);
@@ -108,12 +106,8 @@ inline void mqtt_client::send_connect_packet() {
     pkt.keep_alive_seconds = keep_alive_seconds_;
     pkt.clean_session = clean_session_;
 
-    std::vector<uint8_t> data = pkt.serialize();
-    std::cerr << "[DEBUG] send_connect_packet: " << data.size() << " bytes" << std::endl;
-
     auto self = shared_from_this();
-    conn_->async_write_packet(data, [this, self](const asio::error_code& ec) {
-        std::cerr << "[DEBUG] CONNECT packet written, ec=" << ec.value() << std::endl;
+    conn_->async_write_packet(pkt.serialize(), [this, self](const asio::error_code& ec) {
         if (!ec) {
             schedule_pingreq();
             start_read_loop();
@@ -125,7 +119,6 @@ inline void mqtt_client::start_read_loop() {
     auto self = shared_from_this();
     conn_->async_read_packet(
         [this, self](const asio::error_code& ec, const std::vector<uint8_t>& data) {
-            std::cerr << "[DEBUG] read callback: ec=" << ec.value() << " data.size=" << data.size() << std::endl;
             if (ec) {
                 conn_->close();
                 if (on_close_cb_) on_close_cb_();
@@ -143,8 +136,6 @@ inline void mqtt_client::handle_packet(const std::vector<uint8_t>& data) {
     reader.read_uint8(packet_type_byte);
 
     auto pt = to_packet_type(packet_type_byte >> 4);
-    std::cerr << "[DEBUG] handle_packet: type=" << to_string(pt) << " (0x" << std::hex << (int)packet_type_byte << std::dec << "), size=" << data.size() << std::endl;
-
     switch (pt) {
         case packet_type::connack:
             handle_connack(data);
@@ -154,15 +145,14 @@ inline void mqtt_client::handle_packet(const std::vector<uint8_t>& data) {
             break;
         case packet_type::pingresp:
             cancel_ping_timer();
+            schedule_pingreq();
             break;
         default:
-            std::cerr << "[DEBUG] unhandled packet type: " << to_string(pt) << std::endl;
             break;
     }
 }
 
 inline void mqtt_client::handle_connack(const std::vector<uint8_t>& data) {
-    std::cerr << "[DEBUG] handle_connack called, on_connect_cb_=" << (bool)on_connect_cb_ << std::endl;
     connack_packet pkt = connack_packet::parse(data);
     if (on_connect_cb_) on_connect_cb_(pkt.return_code == 0, pkt.return_code);
 }

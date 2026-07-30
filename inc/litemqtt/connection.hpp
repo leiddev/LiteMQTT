@@ -71,10 +71,8 @@ inline void connection::async_connect(const std::string& host, uint16_t port, co
     state_ = connection_state::connecting;
 
     auto self = shared_from_this();
-    std::cerr << "[DEBUG] connection::async_resolve start" << std::endl;
     resolver_.async_resolve(host, std::to_string(port),
         [this, self, handler](const asio::error_code& ec, asio::ip::tcp::resolver::results_type results) {
-            std::cerr << "[DEBUG] connection::async_resolve done, ec=" << ec.value() << std::endl;
             if (ec) {
                 handler(ec);
                 return;
@@ -82,7 +80,6 @@ inline void connection::async_connect(const std::string& host, uint16_t port, co
 
             asio::async_connect(socket_, results,
                 [this, self, handler](const asio::error_code& ec, const asio::ip::tcp::endpoint&) {
-                    std::cerr << "[DEBUG] connection::async_connect done, ec=" << ec.value() << std::endl;
                     if (!ec) {
                         state_ = connection_state::handshaking;
                     }
@@ -92,7 +89,6 @@ inline void connection::async_connect(const std::string& host, uint16_t port, co
 }
 
 inline void connection::async_read_packet(read_handler handler) {
-    std::cerr << "[DEBUG] async_read_packet called" << std::endl;
     read_fixed_header(handler);
 }
 
@@ -101,15 +97,9 @@ inline void connection::read_fixed_header(read_handler handler) {
     ++reading_depth_;
 
     auto self = shared_from_this();
-    std::cerr << "[DEBUG] read_fixed_header: reading 2 bytes..." << std::endl;
-
     asio::async_read(socket_,
         asio::buffer(fixed_header_.data(), 2),
-        [this, self, handler](const asio::error_code& ec, std::size_t bytes_transferred) {
-            std::cerr << "[DEBUG] read_fixed_header done: ec=" << ec.value()
-                      << " fixed_header[0]=0x" << std::hex << (int)fixed_header_[0]
-                      << " fixed_header[1]=0x" << std::hex << (int)fixed_header_[1] << std::dec
-                      << " bytes=" << bytes_transferred << std::endl;
+        [this, self, handler](const asio::error_code& ec, std::size_t /*bytes_transferred*/) {
             if (ec) {
                 reading_depth_ = 0;
                 io_.post([handler, ec]() { handler(ec, {}); });
@@ -215,11 +205,9 @@ inline void connection::read_packet_body(read_handler handler, std::size_t remai
 
 inline void connection::async_write_packet(const std::vector<uint8_t>& data, write_handler handler) {
     auto self = shared_from_this();
-    std::cerr << "[DEBUG] async_write_packet: size=" << data.size() << std::endl;
     asio::async_write(socket_,
         asio::buffer(data.data(), data.size()),
-        [this, self, handler](const asio::error_code& ec, std::size_t bytes) {
-            std::cerr << "[DEBUG] async_write_packet done: ec=" << ec.value() << " bytes=" << bytes << std::endl;
+        [this, self, handler](const asio::error_code& ec, std::size_t /*bytes*/) {
             handler(ec);
         });
 }
