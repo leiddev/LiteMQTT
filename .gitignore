@@ -1,0 +1,39 @@
+# Build directories
+/build/
+/out/
+
+# Visual Studio
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxuser
+*.user
+*.suo
+.vs/
+
+# IDE
+.vscode/
+
+# CMake
+CMakeCache.txt
+cmake_install.cmake
+CMakeFiles/
+CTestTestfile.cmake
+cmake_build/
+CMakeSettings.json
+
+# Compiled files
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.a
+*.lib
+*.dylib
+*.pdb
+*.ilk
+*.exp
+
+# Logs
+*.log
