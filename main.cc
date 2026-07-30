@@ -73,26 +73,26 @@ int main(int argc, char* argv[]) {
         std::cout << "Connected to broker" << std::endl;
 
         // Subscribe with callback
-        client->async_subscribe(subscribe_topic, [subscribe_topic](bool success, uint8_t qos) {
+        client->async_subscribe(subscribe_topic, [](bool success, std::string topic, uint8_t qos) {
             if (success) {
-                std::cout << "Subscribed to: " << subscribe_topic << " with QoS " << static_cast<int>(qos) << std::endl;
+                std::cout << "Subscribed to: " << topic << " with QoS " << static_cast<int>(qos) << std::endl;
             } else {
-                std::cerr << "Failed to subscribe to: " << subscribe_topic << std::endl;
+                std::cerr << "Failed to subscribe to: " << topic << std::endl;
             }
         });
 
         // Publish with callback (QoS 1 for delivery confirmation)
-        client->async_publish(publish_topic, payload, 1, [publish_topic](bool success) {
+        client->async_publish(publish_topic, payload, 1, [](bool success, std::string topic, uint8_t qos) {
             if (success) {
-                std::cout << "Published message on: " << publish_topic << std::endl;
+                std::cout << "Published message on: " << topic << " (QoS " << static_cast<int>(qos) << ")" << std::endl;
             } else {
-                std::cerr << "Failed to publish on: " << publish_topic << std::endl;
+                std::cerr << "Failed to publish on: " << topic << std::endl;
             }
         });
     });
 
-    client->on_message([](std::string topic, std::string msg) {
-        std::cout << "Received message on [" << topic << "]: " << msg << std::endl;
+    client->on_message([](std::string topic, std::string msg, uint8_t qos) {
+        std::cout << "Received message on [" << topic << "] (QoS " << static_cast<int>(qos) << "): " << msg << std::endl;
     });
 
     client->on_close([]() {

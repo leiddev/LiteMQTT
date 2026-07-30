@@ -102,7 +102,7 @@ int main() {
         }
     });
 
-    client->on_message([](std::string topic, std::string payload) {
+    client->on_message([](std::string topic, std::string payload, uint8_t qos) {
         // handle incoming message
     });
 

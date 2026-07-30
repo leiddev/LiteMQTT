@@ -18,10 +18,10 @@
 namespace litemqtt {
 
 using connect_cb = std::function<void(bool success, uint8_t return_code)>;
-using message_cb = std::function<void(std::string topic, std::string payload)>;
+using message_cb = std::function<void(std::string topic, std::string payload, uint8_t qos)>;
 using close_cb = std::function<void()>;
-using subscribe_cb = std::function<void(bool success, uint8_t qos_granted)>;
-using publish_cb = std::function<void(bool success)>;
+using subscribe_cb = std::function<void(bool success, std::string topic, uint8_t qos_granted)>;
+using publish_cb = std::function<void(bool success, std::string topic, uint8_t qos)>;
 
 class mqtt_client : public std::enable_shared_from_this<mqtt_client> {
 public:
@@ -79,7 +79,7 @@ private:
     publish_cb on_publish_cb_;
 
     std::map<uint16_t, std::pair<std::string, subscribe_cb>> pending_subscribes_;
-    std::map<uint16_t, publish_cb> pending_publishes_;
+    std::map<uint16_t, std::tuple<std::string, uint8_t, publish_cb>> pending_publishes_;
 
     std::shared_ptr<asio::steady_timer> ping_timer_;
 };
@@ -186,7 +186,7 @@ inline void mqtt_client::handle_connack(const std::vector<uint8_t>& data) {
 
 inline void mqtt_client::handle_publish(const std::vector<uint8_t>& data) {
     publish_packet pkt = publish_packet::parse(data);
-    if (on_message_cb_) on_message_cb_(pkt.topic_name, pkt.payload);
+    if (on_message_cb_) on_message_cb_(pkt.topic_name, pkt.payload, pkt.qos);
 
     if (pkt.qos == 1) {
         puback_packet puback;
@@ -201,17 +201,18 @@ inline void mqtt_client::handle_suback(const std::vector<uint8_t>& data) {
     auto it = pending_subscribes_.find(pkt.packet_id);
     if (it != pending_subscribes_.end()) {
         subscribe_cb cb = it->second.second;
+        std::string topic = it->second.first;
         pending_subscribes_.erase(it);
         if (cb) {
             bool success = !pkt.return_codes.empty() && pkt.return_codes[0] != 0x80;
             uint8_t qos_granted = (!pkt.return_codes.empty() && success) ? pkt.return_codes[0] : 0;
-            cb(success, qos_granted);
+            cb(success, topic, qos_granted);
         }
     }
     if (on_subscribe_cb_) {
         bool success = !pkt.return_codes.empty() && pkt.return_codes[0] != 0x80;
         uint8_t qos_granted = (!pkt.return_codes.empty() && success) ? pkt.return_codes[0] : 0;
-        on_subscribe_cb_(success, qos_granted);
+        on_subscribe_cb_(success, "", qos_granted);
     }
 }
 
@@ -219,14 +220,16 @@ inline void mqtt_client::handle_puback(const std::vector<uint8_t>& data) {
     puback_packet pkt = puback_packet::parse(data);
     auto it = pending_publishes_.find(pkt.packet_id);
     if (it != pending_publishes_.end()) {
-        publish_cb cb = it->second;
+        publish_cb cb = std::get<2>(it->second);
+        std::string topic = std::get<0>(it->second);
+        uint8_t qos = std::get<1>(it->second);
         pending_publishes_.erase(it);
         if (cb) {
-            cb(true);
+            cb(true, topic, qos);
         }
     }
     if (on_publish_cb_) {
-        on_publish_cb_(true);
+        on_publish_cb_(true, "", 0);
     }
 }
 
@@ -280,12 +283,12 @@ inline void mqtt_client::async_publish(const std::string& topic, const std::stri
     pkt.qos = qos;
     if (qos > 0) {
         pkt.packet_id = next_packet_id_++;
-        pending_publishes_[pkt.packet_id] = callback;
+        pending_publishes_[pkt.packet_id] = {topic, qos, callback};
     }
     auto self = shared_from_this();
-    conn_->async_write_packet(pkt.serialize(), [this, self, callback](const asio::error_code& ec) {
+    conn_->async_write_packet(pkt.serialize(), [this, self, topic, qos, callback](const asio::error_code& ec) {
         if (ec && callback) {
-            callback(false);
+            callback(false, topic, qos);
         }
     });
 }
@@ -302,7 +305,7 @@ inline void mqtt_client::async_subscribe(const std::string& topic, subscribe_cb 
                 auto it = pending_subscribes_.find(next_packet_id_ - 1);
                 if (it != pending_subscribes_.end()) {
                     auto& cb = it->second.second;
-                    if (cb) cb(false, 0);
+                    if (cb) cb(false, "", 0);
                     pending_subscribes_.erase(it);
                 }
             }
