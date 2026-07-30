@@ -24,6 +24,8 @@ int main(int argc, char* argv[]) {
     std::string subscribe_topic = "litemqtt/demo";
     std::string publish_topic = "litemqtt/demo";
     std::string payload = "Hello from LiteMQTT!";
+    std::string username;
+    std::string password;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -33,6 +35,8 @@ int main(int argc, char* argv[]) {
         else if (arg == "--subscribe" && i + 1 < argc) subscribe_topic = argv[++i];
         else if (arg == "--publish" && i + 1 < argc) publish_topic = argv[++i];
         else if (arg == "--payload" && i + 1 < argc) payload = argv[++i];
+        else if (arg == "--username" && i + 1 < argc) username = argv[++i];
+        else if (arg == "--password" && i + 1 < argc) password = argv[++i];
     }
 
     std::signal(SIGINT, signal_handler);
@@ -40,6 +44,9 @@ int main(int argc, char* argv[]) {
     std::cout << "LiteMQTT Demo Client" << std::endl;
     std::cout << "  Host: " << host << ":" << port << std::endl;
     std::cout << "  Client ID: " << client_id << std::endl;
+    if (!username.empty()) {
+        std::cout << "  Username: " << username << std::endl;
+    }
     std::cout << "  Subscribe topic: " << subscribe_topic << std::endl;
     std::cout << "  Publish topic: " << publish_topic << std::endl;
 
@@ -49,6 +56,12 @@ int main(int argc, char* argv[]) {
     client->set_client_id(client_id);
     client->set_keep_alive(60);
     client->set_clean_session(true);
+    if (!username.empty()) {
+        client->set_username(username);
+    }
+    if (!password.empty()) {
+        client->set_password(password);
+    }
 
     client->on_connect([client, subscribe_topic, publish_topic, payload](bool success, uint8_t rc) {
         if (!success) {

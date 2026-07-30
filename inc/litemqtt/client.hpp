@@ -28,6 +28,8 @@ public:
     void set_client_id(const std::string& id);
     void set_keep_alive(uint16_t seconds);
     void set_clean_session(bool clean);
+    void set_username(const std::string& username);
+    void set_password(const std::string& password);
 
     void async_connect(const std::string& host, uint16_t port,
                         connect_cb callback = nullptr);
@@ -57,6 +59,8 @@ private:
     std::string client_id_ = "litemqtt_cpp";
     uint16_t keep_alive_seconds_ = 60;
     bool clean_session_ = true;
+    std::string username_;
+    std::string password_;
 
     uint16_t next_packet_id_ = 1;
 
@@ -82,6 +86,8 @@ inline mqtt_client::~mqtt_client() {
 inline void mqtt_client::set_client_id(const std::string& id) { client_id_ = id; }
 inline void mqtt_client::set_keep_alive(uint16_t seconds) { keep_alive_seconds_ = seconds; }
 inline void mqtt_client::set_clean_session(bool clean) { clean_session_ = clean; }
+inline void mqtt_client::set_username(const std::string& username) { username_ = username; }
+inline void mqtt_client::set_password(const std::string& password) { password_ = password; }
 
 inline void mqtt_client::async_connect(const std::string& host, uint16_t port, connect_cb callback) {
     if (callback) {
@@ -105,6 +111,8 @@ inline void mqtt_client::send_connect_packet() {
     pkt.client_id = client_id_;
     pkt.keep_alive_seconds = keep_alive_seconds_;
     pkt.clean_session = clean_session_;
+    pkt.username = username_;
+    pkt.password = password_;
 
     auto self = shared_from_this();
     conn_->async_write_packet(pkt.serialize(), [this, self](const asio::error_code& ec) {

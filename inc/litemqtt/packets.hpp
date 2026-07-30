@@ -18,6 +18,8 @@ struct connect_packet {
     std::string client_id;
     uint16_t keep_alive_seconds;
     bool clean_session;
+    std::string username;
+    std::string password;
 
     std::vector<uint8_t> serialize() const {
         std::vector<uint8_t> buf;
@@ -31,10 +33,23 @@ struct connect_packet {
         if (clean_session) {
             connect_flags |= 0x02;
         }
+        if (!username.empty()) {
+            connect_flags |= 0x80;
+        }
+        if (!password.empty()) {
+            connect_flags |= 0x40;
+        }
         variable_header.write_uint8(connect_flags);
 
         variable_header.write_uint16(keep_alive_seconds);
         variable_header.write_string(client_id);
+
+        if (!username.empty()) {
+            variable_header.write_string(username);
+        }
+        if (!password.empty()) {
+            variable_header.write_string(password);
+        }
 
         writer.write_uint8(to_uint8(packet_type::connect) << 4);
         writer.write_remaining_length(variable_header.size());
@@ -63,9 +78,18 @@ struct connect_packet {
         uint8_t connect_flags = 0;
         reader.read_uint8(connect_flags);
         pkt.clean_session = (connect_flags & 0x02) != 0;
+        bool has_username = (connect_flags & 0x80) != 0;
+        bool has_password = (connect_flags & 0x40) != 0;
 
         reader.read_uint16(pkt.keep_alive_seconds);
         reader.read_string(pkt.client_id);
+
+        if (has_username) {
+            reader.read_string(pkt.username);
+        }
+        if (has_password) {
+            reader.read_string(pkt.password);
+        }
 
         return pkt;
     }
