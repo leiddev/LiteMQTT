@@ -47,14 +47,6 @@ public:
         return state_;
     }
 
-    std::vector<uint8_t> debug_last_written_packet() const {
-        return last_written_packet_;
-    }
-
-    void debug_clear_last_written_packet() {
-        last_written_packet_.clear();
-    }
-
 private:
     void read_fixed_header(read_handler handler);
     void read_remaining_length(read_handler handler, uint8_t first_byte);
@@ -69,7 +61,6 @@ private:
     int reading_depth_ = 0;
 
     close_handler close_handler_;
-    std::vector<uint8_t> last_written_packet_;
 };
 
 inline connection::connection(asio::io_context& io)
@@ -213,7 +204,6 @@ inline void connection::read_packet_body(read_handler handler, std::size_t remai
 }
 
 inline void connection::async_write_packet(const std::vector<uint8_t>& data, write_handler handler) {
-    last_written_packet_ = data;
     auto self = shared_from_this();
     asio::async_write(socket_,
         asio::buffer(data.data(), data.size()),
