@@ -287,8 +287,12 @@ inline void mqtt_client::async_publish(const std::string& topic, const std::stri
     }
     auto self = shared_from_this();
     conn_->async_write_packet(pkt.serialize(), [this, self, topic, qos, callback](const asio::error_code& ec) {
-        if (ec && callback) {
-            callback(false, topic, qos);
+        if (ec) {
+            if (callback) callback(false, topic, qos);
+        } else if (qos == 0) {
+            // QoS 0 has no PUBACK, so we fire the success callback as soon as the
+            // bytes are written to the underlying socket ("handed off to transport").
+            if (callback) callback(true, topic, qos);
         }
     });
 }
