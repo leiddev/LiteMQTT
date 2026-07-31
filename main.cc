@@ -73,7 +73,7 @@ int main(int argc, char* argv[]) {
         std::cout << "Connected to broker" << std::endl;
 
         // Subscribe with callback
-        client->async_subscribe(subscribe_topic, 1, [](bool success, std::string topic, uint8_t qos) {
+        client->async_subscribe(subscribe_topic, 2, [](bool success, std::string topic, uint8_t qos) {
             if (success) {
                 std::cout << "Subscribed to: " << topic << " with QoS " << static_cast<int>(qos) << std::endl;
             } else {
@@ -116,7 +116,7 @@ int main(int argc, char* argv[]) {
 
     while (!g_should_exit) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        client->async_publish(publish_topic, payload, 0);
+        client->async_publish(publish_topic, payload, 2);
     }
 
     client->async_disconnect();

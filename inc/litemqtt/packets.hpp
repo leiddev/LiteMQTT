@@ -304,6 +304,78 @@ struct puback_packet {
     }
 };
 
+struct pubcomp_packet {
+    uint16_t packet_id = 0;
+
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> buf;
+        buffer_writer writer(buf);
+        writer.write_uint8(to_uint8(packet_type::pubcomp) << 4);
+        writer.write_uint8(2);
+        writer.write_uint16(packet_id);
+        return buf;
+    }
+
+    static pubcomp_packet parse(const std::vector<uint8_t>& data) {
+        buffer_reader reader(data);
+        uint8_t packet_type_byte = 0;
+        reader.read_uint8(packet_type_byte);
+        std::size_t remaining_len = 0;
+        reader.read_remaining_length(remaining_len);
+        pubcomp_packet pkt;
+        reader.read_uint16(pkt.packet_id);
+        return pkt;
+    }
+};
+
+struct pubrel_packet {
+    uint16_t packet_id = 0;
+
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> buf;
+        buffer_writer writer(buf);
+        writer.write_uint8((to_uint8(packet_type::pubrel) << 4) | 0x02);
+        writer.write_uint8(2);
+        writer.write_uint16(packet_id);
+        return buf;
+    }
+
+    static pubrel_packet parse(const std::vector<uint8_t>& data) {
+        buffer_reader reader(data);
+        uint8_t packet_type_byte = 0;
+        reader.read_uint8(packet_type_byte);
+        std::size_t remaining_len = 0;
+        reader.read_remaining_length(remaining_len);
+        pubrel_packet pkt;
+        reader.read_uint16(pkt.packet_id);
+        return pkt;
+    }
+};
+
+struct pubrec_packet {
+    uint16_t packet_id = 0;
+
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> buf;
+        buffer_writer writer(buf);
+        writer.write_uint8(to_uint8(packet_type::pubrec) << 4);
+        writer.write_uint8(2);
+        writer.write_uint16(packet_id);
+        return buf;
+    }
+
+    static pubrec_packet parse(const std::vector<uint8_t>& data) {
+        buffer_reader reader(data);
+        uint8_t packet_type_byte = 0;
+        reader.read_uint8(packet_type_byte);
+        std::size_t remaining_len = 0;
+        reader.read_remaining_length(remaining_len);
+        pubrec_packet pkt;
+        reader.read_uint16(pkt.packet_id);
+        return pkt;
+    }
+};
+
 struct unsuback_packet {
     uint16_t packet_id = 0;
 

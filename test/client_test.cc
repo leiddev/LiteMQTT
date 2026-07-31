@@ -43,6 +43,18 @@ std::vector<uint8_t> build_publish_bytes(uint16_t packet_id,
     return pkt.serialize();
 }
 
+std::vector<uint8_t> build_pubrec_bytes(uint16_t packet_id) {
+    pubrec_packet pkt;
+    pkt.packet_id = packet_id;
+    return pkt.serialize();
+}
+
+std::vector<uint8_t> build_pubcomp_bytes(uint16_t packet_id) {
+    pubcomp_packet pkt;
+    pkt.packet_id = packet_id;
+    return pkt.serialize();
+}
+
 std::shared_ptr<mqtt_client> make_test_client(asio::io_context& io) {
     return std::make_shared<mqtt_client>(io);
 }
@@ -175,6 +187,115 @@ TEST(MqttClientTest, PublishPacketDupClearedByDefault) {
     pkt.payload = "y";
     auto data = pkt.serialize();
     EXPECT_EQ(data[0] & 0x08, 0x00);
+}
+
+TEST(MqttClientTest, PubrecMovesToPendingPubrel) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+
+    uint16_t pid = 15;
+    client->debug_insert_pending_publish_with_cb_for_pubrec(pid, nullptr);
+
+    EXPECT_EQ(client->debug_pending_publish_count(), 1u);
+    EXPECT_EQ(client->debug_pending_pubrec_count(), 0u);
+
+    client->handle_pubrec(build_pubrec_bytes(pid));
+
+    // After PUBREC, entry moves from pending_publishes_ to pending_pubrecs_
+    EXPECT_EQ(client->debug_pending_publish_count(), 0u);
+    EXPECT_EQ(client->debug_pending_pubrec_count(), 1u);
+}
+
+TEST(MqttClientTest, PubcompCompletesQos2Publish) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+
+    bool fired = false;
+    bool got_success = false;
+    uint16_t pid = 17;
+
+    client->debug_insert_pending_publish_with_cb_for_pubrec(pid,
+        [&](bool success, std::string, uint8_t, uint16_t) {
+            fired = true;
+            got_success = success;
+        });
+
+    client->handle_pubrec(build_pubrec_bytes(pid));
+    EXPECT_EQ(client->debug_pending_pubrec_count(), 1u);
+
+    client->handle_pubcomp(build_pubcomp_bytes(pid));
+
+    EXPECT_TRUE(fired);
+    EXPECT_TRUE(got_success);
+    EXPECT_EQ(client->debug_pending_publish_count(), 0u);
+    EXPECT_EQ(client->debug_pending_pubrec_count(), 0u);
+}
+
+TEST(MqttClientTest, SubackQoS2GrantsQoS2) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+
+    uint16_t pid = 21;
+    std::vector<std::tuple<bool, std::string, uint8_t>> calls;
+    client->debug_insert_pending_subscribe_with_cb(pid,
+        {{"qos2/topic", 2}},
+        [&](bool success, std::string topic, uint8_t qos) {
+            calls.emplace_back(success, topic, qos);
+        });
+
+    client->handle_suback(build_suback_bytes(pid, {0x02}));
+
+    ASSERT_EQ(calls.size(), 1u);
+    EXPECT_TRUE(std::get<0>(calls[0]));
+    EXPECT_EQ(std::get<1>(calls[0]), "qos2/topic");
+    EXPECT_EQ(std::get<2>(calls[0]), 2);
+}
+
+TEST(MqttClientTest, PubrelAbandonsAfterMaxRetries) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+
+    bool close_fired = false;
+    client->debug_set_close_callback([&]() {
+        close_fired = true;
+    });
+
+    uint16_t pid = 25;
+    // Insert pending publish to be moved to pending_pubrec on PUBREC
+    client->debug_insert_pending_publish_with_cb_for_pubrec(pid, nullptr);
+    client->handle_pubrec(build_pubrec_bytes(pid));
+
+    EXPECT_EQ(client->debug_pending_pubrec_count(), 1u);
+
+    // Fire timer 4 times - attempts goes 0→1→2→3, then 3>=3 triggers close
+    client->debug_expire_pubrec_timer_now(pid);
+    io.run_one();
+
+    client->debug_expire_pubrec_timer_now(pid);
+    io.run_one();
+
+    client->debug_expire_pubrec_timer_now(pid);
+    io.run_one();
+
+    client->debug_expire_pubrec_timer_now(pid);
+    io.run_one();
+
+    EXPECT_EQ(client->debug_pending_pubrec_count(), 0u);
+    EXPECT_FALSE(client->debug_is_connected());
+    EXPECT_TRUE(close_fired);
+}
+
+TEST(MqttClientTest, InboundPublishQoS2SendsPubrec) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+
+    client->handle_publish(build_publish_bytes(30, "test/topic", "hello", 2, false));
+
+    auto written = client->debug_last_written_packet();
+    ASSERT_FALSE(written.empty());
+
+    pubrec_packet pubrec = pubrec_packet::parse(written);
+    EXPECT_EQ(pubrec.packet_id, 30);
 }
 
 }  // namespace
