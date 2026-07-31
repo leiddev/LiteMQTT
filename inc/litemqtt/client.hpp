@@ -186,7 +186,16 @@ inline void mqtt_client::handle_connack(const std::vector<uint8_t>& data) {
 
 inline void mqtt_client::handle_publish(const std::vector<uint8_t>& data) {
     publish_packet pkt = publish_packet::parse(data);
-    if (on_message_cb_) on_message_cb_(pkt.topic_name, pkt.payload, pkt.qos, pkt.packet_id);
+
+    if (pkt.qos > 2) {
+        std::cerr << "Protocol error: PUBLISH with invalid QoS " << static_cast<int>(pkt.qos) << std::endl;
+        conn_->close();
+        if (on_close_cb_) on_close_cb_();
+        return;
+    }
+
+    uint16_t message_id = (pkt.qos == 0) ? 0 : pkt.packet_id;
+    if (on_message_cb_) on_message_cb_(pkt.topic_name, pkt.payload, pkt.qos, message_id);
 
     if (pkt.qos == 1) {
         puback_packet puback;
@@ -194,6 +203,8 @@ inline void mqtt_client::handle_publish(const std::vector<uint8_t>& data) {
         auto self = shared_from_this();
         conn_->async_write_packet(puback.serialize(), [self](const asio::error_code&) {});
     }
+    // QoS 2 is not implemented; we still surfaced the message above but the broker
+    // will time out waiting for pubrec/pubrel/pubcomp. Treated as best-effort.
 }
 
 inline void mqtt_client::handle_suback(const std::vector<uint8_t>& data) {
