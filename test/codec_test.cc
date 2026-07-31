@@ -260,6 +260,35 @@ TEST(PublishPacketTest, QoS0NoPacketId) {
     EXPECT_EQ(parsed.payload, "Hello");
 }
 
+TEST(PublishPacketTest, DupBitRoundtrip) {
+    publish_packet pkt;
+    pkt.packet_id = 7;
+    pkt.qos = 1;
+    pkt.dup = true;
+    pkt.topic_name = "test/topic";
+    pkt.payload = "retry";
+
+    std::vector<uint8_t> data = pkt.serialize();
+    EXPECT_NE(data.empty(), true);
+
+    publish_packet parsed = publish_packet::parse(data);
+    EXPECT_TRUE(parsed.dup);
+    EXPECT_EQ(parsed.qos, 1);
+    EXPECT_EQ(parsed.packet_id, 7);
+}
+
+TEST(PublishPacketTest, DupBitClearedByDefault) {
+    publish_packet pkt;
+    pkt.packet_id = 1;
+    pkt.qos = 1;
+    pkt.topic_name = "test/topic";
+    pkt.payload = "first";
+
+    std::vector<uint8_t> data = pkt.serialize();
+    publish_packet parsed = publish_packet::parse(data);
+    EXPECT_FALSE(parsed.dup);
+}
+
 TEST(SubscribePacketTest, Serialize) {
     subscribe_packet pkt;
     pkt.packet_id = 1;

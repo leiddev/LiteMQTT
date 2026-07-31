@@ -2,10 +2,13 @@
 #define LITEMQTT_CLIENT_HPP
 
 #include <cstdint>
+#include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <asio.hpp>
@@ -50,17 +53,70 @@ public:
 
     connection_state state() const;
 
+    void handle_packet(const std::vector<uint8_t>& data);
+    void handle_puback(const std::vector<uint8_t>& data);
+    void handle_suback(const std::vector<uint8_t>& data);
+    void handle_publish(const std::vector<uint8_t>& data);
+
 private:
     void send_connect_packet();
-    void handle_packet(const std::vector<uint8_t>& data);
     void handle_connack(const std::vector<uint8_t>& data);
-    void handle_publish(const std::vector<uint8_t>& data);
-    void handle_suback(const std::vector<uint8_t>& data);
-    void handle_puback(const std::vector<uint8_t>& data);
     void start_read_loop();
     void schedule_pingreq();
     void cancel_ping_timer();
 
+    uint16_t acquire_packet_id();
+    void send_publish_entry(uint16_t packet_id);
+    void arm_publish_retry_timer(uint16_t packet_id);
+    void cancel_publish_retry_timer(uint16_t packet_id);
+    void finish_publish_success(uint16_t packet_id);
+    void finish_publish_failure(uint16_t packet_id);
+    void schedule_dedup_cleanup();
+
+public:
+    // Test hooks (do not use in production code).
+    uint16_t acquire_packet_id_for_test() { return acquire_packet_id(); }
+
+    void debug_insert_pending_publish(uint16_t pid) {
+        pending_publish entry;
+        entry.topic = "test/topic";
+        entry.qos = 1;
+        entry.payload = "payload";
+        entry.timer = std::make_shared<asio::steady_timer>(io_);
+        entry.attempts = 1;
+        pending_publishes_[pid] = std::move(entry);
+    }
+
+    void debug_insert_pending_publish_with_cb(uint16_t pid, publish_cb cb) {
+        pending_publish entry;
+        entry.topic = "test/topic";
+        entry.qos = 1;
+        entry.payload = "payload";
+        entry.callback = std::move(cb);
+        entry.timer = std::make_shared<asio::steady_timer>(io_);
+        entry.attempts = 1;
+        pending_publishes_[pid] = std::move(entry);
+    }
+
+    void debug_clear_pending_publishes() { pending_publishes_.clear(); }
+
+    std::size_t debug_pending_publish_count() const { return pending_publishes_.size(); }
+
+    void debug_insert_pending_subscribe(uint16_t pid,
+                                        std::vector<std::pair<std::string, uint8_t>> filters) {
+        subscribe_cb cb;
+        pending_subscribes_[pid] = {std::move(filters), std::move(cb)};
+    }
+
+    void debug_insert_pending_subscribe_with_cb(uint16_t pid,
+                                                std::vector<std::pair<std::string, uint8_t>> filters,
+                                                subscribe_cb cb) {
+        pending_subscribes_[pid] = {std::move(filters), std::move(cb)};
+    }
+
+    std::size_t debug_pending_subscribe_count() const { return pending_subscribes_.size(); }
+
+private:
     asio::io_context& io_;
     std::shared_ptr<connection> conn_;
 
@@ -72,14 +128,28 @@ private:
 
     uint16_t next_packet_id_ = 1;
 
+    static constexpr std::chrono::seconds kPublishRetryInterval{5};
+
     connect_cb on_connect_cb_;
     message_cb on_message_cb_;
     close_cb on_close_cb_;
     subscribe_cb on_subscribe_cb_;
     publish_cb on_publish_cb_;
 
-    std::map<uint16_t, std::pair<std::string, subscribe_cb>> pending_subscribes_;
-    std::map<uint16_t, std::tuple<std::string, uint8_t, publish_cb>> pending_publishes_;
+    struct pending_publish {
+        std::string topic;
+        uint8_t qos = 0;
+        std::string payload;
+        publish_cb callback;
+        std::shared_ptr<asio::steady_timer> timer;
+        int attempts = 0;
+    };
+
+    std::map<uint16_t, std::pair<std::vector<std::pair<std::string, uint8_t>>, subscribe_cb>> pending_subscribes_;
+    std::map<uint16_t, pending_publish> pending_publishes_;
+
+    std::unordered_set<uint16_t> recently_seen_publish_ids_;
+    std::shared_ptr<asio::steady_timer> dedup_cleanup_timer_;
 
     std::shared_ptr<asio::steady_timer> ping_timer_;
 };
@@ -87,6 +157,7 @@ private:
 inline mqtt_client::mqtt_client(asio::io_context& io)
     : io_(io), conn_(std::make_shared<connection>(io)) {
     ping_timer_ = std::make_shared<asio::steady_timer>(io);
+    dedup_cleanup_timer_ = std::make_shared<asio::steady_timer>(io);
 }
 
 inline mqtt_client::~mqtt_client() {
@@ -194,8 +265,19 @@ inline void mqtt_client::handle_publish(const std::vector<uint8_t>& data) {
         return;
     }
 
-    uint16_t message_id = (pkt.qos == 0) ? 0 : pkt.packet_id;
-    if (on_message_cb_) on_message_cb_(pkt.topic_name, pkt.payload, pkt.qos, message_id);
+    bool is_duplicate = false;
+    if (pkt.qos > 0) {
+        auto inserted = recently_seen_publish_ids_.insert(pkt.packet_id);
+        is_duplicate = !inserted.second;
+        if (recently_seen_publish_ids_.size() == 1) {
+            schedule_dedup_cleanup();
+        }
+    }
+
+    if (!is_duplicate) {
+        uint16_t message_id = (pkt.qos == 0) ? 0 : pkt.packet_id;
+        if (on_message_cb_) on_message_cb_(pkt.topic_name, pkt.payload, pkt.qos, message_id);
+    }
 
     if (pkt.qos == 1) {
         puback_packet puback;
@@ -210,37 +292,47 @@ inline void mqtt_client::handle_publish(const std::vector<uint8_t>& data) {
 inline void mqtt_client::handle_suback(const std::vector<uint8_t>& data) {
     suback_packet pkt = suback_packet::parse(data);
     auto it = pending_subscribes_.find(pkt.packet_id);
-    if (it != pending_subscribes_.end()) {
-        subscribe_cb cb = it->second.second;
-        std::string topic = it->second.first;
-        pending_subscribes_.erase(it);
-        if (cb) {
-            bool success = !pkt.return_codes.empty() && pkt.return_codes[0] != 0x80;
-            uint8_t qos_granted = (!pkt.return_codes.empty() && success) ? pkt.return_codes[0] : 0;
-            cb(success, topic, qos_granted);
-        }
+    if (it == pending_subscribes_.end()) {
+        return;
     }
-    if (on_subscribe_cb_) {
-        bool success = !pkt.return_codes.empty() && pkt.return_codes[0] != 0x80;
-        uint8_t qos_granted = (!pkt.return_codes.empty() && success) ? pkt.return_codes[0] : 0;
-        on_subscribe_cb_(success, "", qos_granted);
+
+    const auto& filters_ref = it->second.first;
+    subscribe_cb cb = it->second.second;
+    std::vector<std::pair<std::string, uint8_t>> filters{filters_ref};
+    pending_subscribes_.erase(it);
+
+    if (!cb) {
+        return;
+    }
+
+    if (pkt.return_codes.size() < filters.size()) {
+        conn_->close();
+        if (on_close_cb_) on_close_cb_();
+        return;
+    }
+
+    for (std::size_t i = 0; i < filters.size(); ++i) {
+        uint8_t rc = pkt.return_codes[i];
+        bool success = rc != 0x80;
+        uint8_t qos_granted = success ? rc : 0;
+        cb(success, filters[i].first, qos_granted);
     }
 }
 
 inline void mqtt_client::handle_puback(const std::vector<uint8_t>& data) {
     puback_packet pkt = puback_packet::parse(data);
     auto it = pending_publishes_.find(pkt.packet_id);
-    if (it != pending_publishes_.end()) {
-        publish_cb cb = std::get<2>(it->second);
-        std::string topic = std::get<0>(it->second);
-        uint8_t qos = std::get<1>(it->second);
-        pending_publishes_.erase(it);
-        if (cb) {
-            cb(true, topic, qos, pkt.packet_id);
-        }
+    if (it == pending_publishes_.end()) {
+        return;
     }
-    if (on_publish_cb_) {
-        on_publish_cb_(true, "", 0, pkt.packet_id);
+
+    std::string topic = it->second.topic;
+    uint8_t qos = it->second.qos;
+    publish_cb cb = it->second.callback;
+    cancel_publish_retry_timer(pkt.packet_id);
+    pending_publishes_.erase(it);
+    if (cb) {
+        cb(true, topic, qos, pkt.packet_id);
     }
 }
 
@@ -288,45 +380,69 @@ inline void mqtt_client::async_disconnect() {
 
 inline void mqtt_client::async_publish(const std::string& topic, const std::string& payload,
                                         uint8_t qos, publish_cb callback) {
-    publish_packet pkt;
-    pkt.topic_name = topic;
-    pkt.payload = payload;
-    pkt.qos = qos;
-    uint16_t packet_id = (qos > 0) ? next_packet_id_++ : 0;
-    if (qos > 0) {
-        pkt.packet_id = packet_id;
-        pending_publishes_[packet_id] = {topic, qos, callback};
+    if (qos > 2) {
+        std::cerr << "async_publish: invalid QoS " << static_cast<int>(qos) << std::endl;
+        if (callback) callback(false, topic, qos, 0);
+        return;
     }
-    auto self = shared_from_this();
-    conn_->async_write_packet(pkt.serialize(), [this, self, topic, qos, packet_id, callback](const asio::error_code& ec) {
-        if (ec) {
-            if (callback) callback(false, topic, qos, packet_id);
-        } else if (qos == 0) {
-            // QoS 0 has no PUBACK, so we fire the success callback as soon as the
-            // bytes are written to the underlying socket ("handed off to transport").
-            if (callback) callback(true, topic, qos, packet_id);
-        }
-    });
+
+    if (qos == 0) {
+        publish_packet pkt;
+        pkt.topic_name = topic;
+        pkt.payload = payload;
+        pkt.qos = 0;
+        pkt.dup = false;
+
+        auto self = shared_from_this();
+        conn_->async_write_packet(pkt.serialize(),
+            [self, callback, topic](const asio::error_code& ec) {
+                if (callback) callback(ec ? false : true, topic, 0, 0);
+            });
+        return;
+    }
+
+    uint16_t packet_id = acquire_packet_id();
+    pending_publish entry;
+    entry.topic = topic;
+    entry.qos = qos;
+    entry.payload = payload;
+    entry.callback = callback;
+    entry.timer = std::make_shared<asio::steady_timer>(io_);
+    entry.attempts = 1;
+    pending_publishes_[packet_id] = std::move(entry);
+
+    send_publish_entry(packet_id);
 }
 
 inline void mqtt_client::async_subscribe(const std::string& topic, uint8_t qos, subscribe_cb callback) {
+    if (qos > 2) {
+        std::cerr << "async_subscribe: invalid QoS " << static_cast<int>(qos) << std::endl;
+        if (callback) callback(false, topic, 0);
+        return;
+    }
+
+    uint16_t packet_id = acquire_packet_id();
+
     subscribe_packet pkt;
-    pkt.packet_id = next_packet_id_++;
+    pkt.packet_id = packet_id;
     pkt.topic_filters.push_back(std::make_pair(topic, qos));
-    pending_subscribes_[pkt.packet_id] = {topic, callback};
+
+    pending_subscribes_[packet_id] = {pkt.topic_filters, callback};
+
     auto self = shared_from_this();
-    conn_->async_write_packet(pkt.serialize(), [this, self](const asio::error_code& ec) {
-        if (ec) {
-            if (!pending_subscribes_.empty()) {
-                auto it = pending_subscribes_.find(next_packet_id_ - 1);
-                if (it != pending_subscribes_.end()) {
-                    auto& cb = it->second.second;
-                    if (cb) cb(false, "", 0);
-                    pending_subscribes_.erase(it);
-                }
+    conn_->async_write_packet(pkt.serialize(),
+        [this, self, packet_id](const asio::error_code& ec) {
+            if (!ec) return;
+            auto it = pending_subscribes_.find(packet_id);
+            if (it == pending_subscribes_.end()) return;
+            const auto& filters = it->second.first;
+            subscribe_cb cb = it->second.second;
+            pending_subscribes_.erase(it);
+            if (!cb) return;
+            for (const auto& f : filters) {
+                cb(false, f.first, 0);
             }
-        }
-    });
+        });
 }
 
 inline void mqtt_client::on_connect(connect_cb callback) { on_connect_cb_ = std::move(callback); }
@@ -336,6 +452,131 @@ inline void mqtt_client::on_subscribe(subscribe_cb callback) { on_subscribe_cb_ 
 inline void mqtt_client::on_publish(publish_cb callback) { on_publish_cb_ = std::move(callback); }
 
 inline connection_state mqtt_client::state() const { return conn_->state(); }
+
+inline uint16_t mqtt_client::acquire_packet_id() {
+    uint16_t start = next_packet_id_;
+    do {
+        ++next_packet_id_;
+        if (next_packet_id_ == 0) {
+            ++next_packet_id_;
+        }
+        if (next_packet_id_ == start) {
+            break;
+        }
+    } while (pending_publishes_.count(next_packet_id_) || pending_subscribes_.count(next_packet_id_));
+    return next_packet_id_;
+}
+
+inline void mqtt_client::send_publish_entry(uint16_t packet_id) {
+    auto it = pending_publishes_.find(packet_id);
+    if (it == pending_publishes_.end()) {
+        return;
+    }
+
+    pending_publish& entry = it->second;
+
+    publish_packet pkt;
+    pkt.topic_name = entry.topic;
+    pkt.payload = entry.payload;
+    pkt.qos = entry.qos;
+    pkt.packet_id = packet_id;
+    pkt.dup = (entry.attempts > 1);
+
+    arm_publish_retry_timer(packet_id);
+
+    auto self = shared_from_this();
+    conn_->async_write_packet(pkt.serialize(),
+        [this, self, packet_id](const asio::error_code& ec) {
+            if (ec) {
+                // Underlying socket is broken; abort this publish attempt.
+                finish_publish_failure(packet_id);
+                return;
+            }
+            auto cur = pending_publishes_.find(packet_id);
+            if (cur == pending_publishes_.end()) return;
+
+            // Reset the retry window - bytes are on the wire, wait for PUBACK
+            // (or for the timer to fire and trigger a DUP retransmit).
+            arm_publish_retry_timer(packet_id);
+        });
+}
+
+inline void mqtt_client::arm_publish_retry_timer(uint16_t packet_id) {
+    auto it = pending_publishes_.find(packet_id);
+    if (it == pending_publishes_.end()) return;
+
+    auto timer = it->second.timer;
+    timer->expires_after(std::chrono::seconds(5));
+
+    auto self = shared_from_this();
+    timer->async_wait([this, self, packet_id](const asio::error_code& ec) {
+        if (ec) {
+            return;
+        }
+        auto cur = pending_publishes_.find(packet_id);
+        if (cur == pending_publishes_.end()) {
+            return;
+        }
+        pending_publish& e = cur->second;
+        if (e.attempts >= 3) {
+            finish_publish_failure(packet_id);
+            return;
+        }
+        e.attempts += 1;
+        send_publish_entry(packet_id);
+    });
+}
+inline void mqtt_client::cancel_publish_retry_timer(uint16_t packet_id) {
+    auto it = pending_publishes_.find(packet_id);
+    if (it == pending_publishes_.end()) return;
+    asio::error_code ec;
+    it->second.timer->cancel(ec);
+}
+
+inline void mqtt_client::finish_publish_success(uint16_t packet_id) {
+    auto it = pending_publishes_.find(packet_id);
+    if (it == pending_publishes_.end()) return;
+
+    std::string topic = it->second.topic;
+    uint8_t qos = it->second.qos;
+    publish_cb cb = it->second.callback;
+
+    cancel_publish_retry_timer(packet_id);
+    pending_publishes_.erase(it);
+
+    if (cb) {
+        cb(true, topic, qos, packet_id);
+    }
+}
+
+inline void mqtt_client::finish_publish_failure(uint16_t packet_id) {
+    auto it = pending_publishes_.find(packet_id);
+    if (it == pending_publishes_.end()) return;
+
+    std::string topic = it->second.topic;
+    uint8_t qos = it->second.qos;
+    publish_cb cb = it->second.callback;
+
+    cancel_publish_retry_timer(packet_id);
+    pending_publishes_.erase(it);
+
+    if (cb) {
+        cb(false, topic, qos, packet_id);
+    }
+
+    conn_->close();
+    if (on_close_cb_) on_close_cb_();
+}
+
+inline void mqtt_client::schedule_dedup_cleanup() {
+    if (!dedup_cleanup_timer_) return;
+    dedup_cleanup_timer_->expires_after(std::chrono::seconds(120));
+    auto self = shared_from_this();
+    dedup_cleanup_timer_->async_wait([this, self](const asio::error_code& ec) {
+        if (ec) return;
+        recently_seen_publish_ids_.clear();
+    });
+}
 
 }  // namespace litemqtt
 

@@ -16,8 +16,8 @@ constexpr const char* MQTT_PROTOCOL_NAME = "MQTT";
 
 struct connect_packet {
     std::string client_id;
-    uint16_t keep_alive_seconds;
-    bool clean_session;
+    uint16_t keep_alive_seconds = 0;
+    bool clean_session = false;
     std::string username;
     std::string password;
 
@@ -96,8 +96,8 @@ struct connect_packet {
 };
 
 struct connack_packet {
-    uint8_t session_present;
-    uint8_t return_code;
+    uint8_t session_present = 0;
+    uint8_t return_code = 0;
 
     std::vector<uint8_t> serialize() const {
         std::vector<uint8_t> buf;
@@ -129,8 +129,9 @@ struct connack_packet {
 };
 
 struct publish_packet {
-    uint16_t packet_id;
-    uint8_t qos;
+    uint16_t packet_id = 0;
+    uint8_t qos = 0;
+    bool dup = false;
     std::string topic_name;
     std::string payload;
 
@@ -149,6 +150,9 @@ struct publish_packet {
         );
 
         uint8_t flags = (qos & 0x03) << 1;
+        if (dup) {
+            flags |= 0x08;
+        }
         writer.write_uint8((to_uint8(packet_type::publish) << 4) | flags);
         writer.write_remaining_length(variable_header.size());
         writer.write_bytes(variable_header.data(), variable_header.size());
@@ -166,6 +170,7 @@ struct publish_packet {
         reader.read_remaining_length(remaining_len);
 
         publish_packet pkt;
+        pkt.dup = ((packet_type_byte >> 3) & 0x01) != 0;
         pkt.qos = (packet_type_byte >> 1) & 0x03;
         reader.read_string(pkt.topic_name);
         if (pkt.qos > 0) {
@@ -186,7 +191,7 @@ struct publish_packet {
 };
 
 struct subscribe_packet {
-    uint16_t packet_id;
+    uint16_t packet_id = 0;
     std::vector<std::pair<std::string, uint8_t>> topic_filters;
 
     std::vector<uint8_t> serialize() const {
@@ -210,7 +215,7 @@ struct subscribe_packet {
 };
 
 struct suback_packet {
-    uint16_t packet_id;
+    uint16_t packet_id = 0;
     std::vector<uint8_t> return_codes;
 
     std::vector<uint8_t> serialize() const {
@@ -253,7 +258,7 @@ struct suback_packet {
 };
 
 struct unsubscribe_packet {
-    uint16_t packet_id;
+    uint16_t packet_id = 0;
     std::vector<std::string> topic_filters;
 
     std::vector<uint8_t> serialize() const {
@@ -276,7 +281,7 @@ struct unsubscribe_packet {
 };
 
 struct puback_packet {
-    uint16_t packet_id;
+    uint16_t packet_id = 0;
 
     std::vector<uint8_t> serialize() const {
         std::vector<uint8_t> buf;
@@ -300,7 +305,7 @@ struct puback_packet {
 };
 
 struct unsuback_packet {
-    uint16_t packet_id;
+    uint16_t packet_id = 0;
 
     std::vector<uint8_t> serialize() const {
         std::vector<uint8_t> buf;
