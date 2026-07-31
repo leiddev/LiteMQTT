@@ -18,10 +18,10 @@
 namespace litemqtt {
 
 using connect_cb = std::function<void(bool success, uint8_t return_code)>;
-using message_cb = std::function<void(std::string topic, std::string payload, uint8_t qos)>;
+using message_cb = std::function<void(std::string topic, std::string payload, uint8_t qos, uint16_t packet_id)>;
 using close_cb = std::function<void()>;
 using subscribe_cb = std::function<void(bool success, std::string topic, uint8_t qos_granted)>;
-using publish_cb = std::function<void(bool success, std::string topic, uint8_t qos)>;
+using publish_cb = std::function<void(bool success, std::string topic, uint8_t qos, uint16_t packet_id)>;
 
 class mqtt_client : public std::enable_shared_from_this<mqtt_client> {
 public:
@@ -186,7 +186,7 @@ inline void mqtt_client::handle_connack(const std::vector<uint8_t>& data) {
 
 inline void mqtt_client::handle_publish(const std::vector<uint8_t>& data) {
     publish_packet pkt = publish_packet::parse(data);
-    if (on_message_cb_) on_message_cb_(pkt.topic_name, pkt.payload, pkt.qos);
+    if (on_message_cb_) on_message_cb_(pkt.topic_name, pkt.payload, pkt.qos, pkt.packet_id);
 
     if (pkt.qos == 1) {
         puback_packet puback;
@@ -225,11 +225,11 @@ inline void mqtt_client::handle_puback(const std::vector<uint8_t>& data) {
         uint8_t qos = std::get<1>(it->second);
         pending_publishes_.erase(it);
         if (cb) {
-            cb(true, topic, qos);
+            cb(true, topic, qos, pkt.packet_id);
         }
     }
     if (on_publish_cb_) {
-        on_publish_cb_(true, "", 0);
+        on_publish_cb_(true, "", 0, pkt.packet_id);
     }
 }
 
@@ -281,18 +281,19 @@ inline void mqtt_client::async_publish(const std::string& topic, const std::stri
     pkt.topic_name = topic;
     pkt.payload = payload;
     pkt.qos = qos;
+    uint16_t packet_id = (qos > 0) ? next_packet_id_++ : 0;
     if (qos > 0) {
-        pkt.packet_id = next_packet_id_++;
-        pending_publishes_[pkt.packet_id] = {topic, qos, callback};
+        pkt.packet_id = packet_id;
+        pending_publishes_[packet_id] = {topic, qos, callback};
     }
     auto self = shared_from_this();
-    conn_->async_write_packet(pkt.serialize(), [this, self, topic, qos, callback](const asio::error_code& ec) {
+    conn_->async_write_packet(pkt.serialize(), [this, self, topic, qos, packet_id, callback](const asio::error_code& ec) {
         if (ec) {
-            if (callback) callback(false, topic, qos);
+            if (callback) callback(false, topic, qos, packet_id);
         } else if (qos == 0) {
             // QoS 0 has no PUBACK, so we fire the success callback as soon as the
             // bytes are written to the underlying socket ("handed off to transport").
-            if (callback) callback(true, topic, qos);
+            if (callback) callback(true, topic, qos, packet_id);
         }
     });
 }

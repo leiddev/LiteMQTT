@@ -82,17 +82,17 @@ int main(int argc, char* argv[]) {
         });
 
         // Publish with callback (QoS 1 for delivery confirmation)
-        client->async_publish(publish_topic, payload, 1, [](bool success, std::string topic, uint8_t qos) {
+        client->async_publish(publish_topic, payload, 1, [](bool success, std::string topic, uint8_t qos, uint16_t packet_id) {
             if (success) {
-                std::cout << "Published message on: " << topic << " (QoS " << static_cast<int>(qos) << ")" << std::endl;
+                std::cout << "Published message id=" << packet_id << " on: " << topic << " (QoS " << static_cast<int>(qos) << ")" << std::endl;
             } else {
-                std::cerr << "Failed to publish on: " << topic << std::endl;
+                std::cerr << "Failed to publish id=" << packet_id << " on: " << topic << std::endl;
             }
         });
     });
 
-    client->on_message([](std::string topic, std::string msg, uint8_t qos) {
-        std::cout << "Received message on [" << topic << "] (QoS " << static_cast<int>(qos) << "): " << msg << std::endl;
+    client->on_message([](std::string topic, std::string msg, uint8_t qos, uint16_t packet_id) {
+        std::cout << "Received message id=" << packet_id << " on [" << topic << "] (QoS " << static_cast<int>(qos) << "): " << msg << std::endl;
     });
 
     client->on_close([]() {
@@ -116,6 +116,7 @@ int main(int argc, char* argv[]) {
 
     while (!g_should_exit) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        client->async_publish(publish_topic, payload, 0);
     }
 
     client->async_disconnect();
