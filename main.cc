@@ -116,7 +116,9 @@ int main(int argc, char* argv[]) {
 
     while (!g_should_exit) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        client->async_publish(publish_topic, payload, 2);
+        if (client->state() == litemqtt::connection_state::connected) {
+            client->async_publish(publish_topic, payload, 2);
+        }
     }
 
     client->async_disconnect();

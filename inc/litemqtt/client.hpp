@@ -77,6 +77,7 @@ private:
     void finish_publish_success(uint16_t packet_id);
     void finish_publish_failure(uint16_t packet_id);
     void schedule_dedup_cleanup();
+    void notify_closed_once();
 
 public:
     // Test hooks (do not use in production code).
@@ -163,6 +164,7 @@ private:
     std::shared_ptr<asio::steady_timer> dedup_cleanup_timer_;
 
     std::shared_ptr<asio::steady_timer> ping_timer_;
+    bool closed_ = false;
 };
 
 inline mqtt_client::mqtt_client(asio::io_context& io)
@@ -231,8 +233,7 @@ inline void mqtt_client::start_read_loop() {
     conn_->async_read_packet(
         [this, self](const asio::error_code& ec, const std::vector<uint8_t>& data) {
             if (ec) {
-                conn_->close();
-                if (on_close_cb_) on_close_cb_();
+                notify_closed_once();
                 return;
             }
             handle_packet(data);
@@ -280,6 +281,9 @@ inline void mqtt_client::handle_packet(const std::vector<uint8_t>& data) {
 
 inline void mqtt_client::handle_connack(const std::vector<uint8_t>& data) {
     connack_packet pkt = connack_packet::parse(data);
+    if (pkt.return_code == 0) {
+        conn_->mark_connected();
+    }
     if (on_connect_cb_) on_connect_cb_(pkt.return_code == 0, pkt.return_code);
 }
 
@@ -288,8 +292,7 @@ inline void mqtt_client::handle_publish(const std::vector<uint8_t>& data) {
 
     if (pkt.qos > 2) {
         std::cerr << "Protocol error: PUBLISH with invalid QoS " << static_cast<int>(pkt.qos) << std::endl;
-        conn_->close();
-        if (on_close_cb_) on_close_cb_();
+        notify_closed_once();
         return;
     }
 
@@ -338,8 +341,7 @@ inline void mqtt_client::handle_suback(const std::vector<uint8_t>& data) {
     }
 
     if (pkt.return_codes.size() < filters.size()) {
-        conn_->close();
-        if (on_close_cb_) on_close_cb_();
+        notify_closed_once();
         return;
     }
 
@@ -442,16 +444,14 @@ inline void mqtt_client::schedule_pingreq() {
 
         conn_->async_write_packet(data, [this, self](const asio::error_code& write_ec) {
             if (write_ec) {
-                conn_->close();
-                if (on_close_cb_) on_close_cb_();
+                notify_closed_once();
                 return;
             }
 
             ping_timer_->expires_after(std::chrono::seconds(keep_alive_seconds_ / 2));
             ping_timer_->async_wait([this, self](const asio::error_code& timer_ec) {
                 if (timer_ec) return;
-                conn_->close();
-                if (on_close_cb_) on_close_cb_();
+                notify_closed_once();
             });
         });
     });
@@ -473,6 +473,11 @@ inline void mqtt_client::async_disconnect() {
 
 inline void mqtt_client::async_publish(const std::string& topic, const std::string& payload,
                                         uint8_t qos, publish_cb callback) {
+    if (closed_) {
+        if (callback) callback(false, topic, qos, 0);
+        return;
+    }
+
     if (qos > 2) {
         std::cerr << "async_publish: invalid QoS " << static_cast<int>(qos) << std::endl;
         if (callback) callback(false, topic, qos, 0);
@@ -508,6 +513,11 @@ inline void mqtt_client::async_publish(const std::string& topic, const std::stri
 }
 
 inline void mqtt_client::async_subscribe(const std::string& topic, uint8_t qos, subscribe_cb callback) {
+    if (closed_) {
+        if (callback) callback(false, topic, 0);
+        return;
+    }
+
     if (qos > 2) {
         std::cerr << "async_subscribe: invalid QoS " << static_cast<int>(qos) << std::endl;
         if (callback) callback(false, topic, 0);
@@ -639,10 +649,7 @@ inline void mqtt_client::arm_pubrec_retry_timer(uint16_t packet_id) {
             // Give up, close connection
             asio::error_code cancel_ec;
             e.timer->cancel(cancel_ec);
-            pending_pubrecs_.erase(rec_it);
-            pending_publishes_.erase(packet_id);
-            conn_->close();
-            if (on_close_cb_) on_close_cb_();
+            notify_closed_once();
             return;
         }
         e.attempts += 1;
@@ -700,21 +707,20 @@ inline void mqtt_client::finish_publish_success(uint16_t packet_id) {
 
 inline void mqtt_client::finish_publish_failure(uint16_t packet_id) {
     auto it = pending_publishes_.find(packet_id);
-    if (it == pending_publishes_.end()) return;
+    if (it != pending_publishes_.end()) {
+        std::string topic = it->second.topic;
+        uint8_t qos = it->second.qos;
+        publish_cb cb = it->second.callback;
 
-    std::string topic = it->second.topic;
-    uint8_t qos = it->second.qos;
-    publish_cb cb = it->second.callback;
+        cancel_publish_retry_timer(packet_id);
+        pending_publishes_.erase(it);
 
-    cancel_publish_retry_timer(packet_id);
-    pending_publishes_.erase(it);
-
-    if (cb) {
-        cb(false, topic, qos, packet_id);
+        if (cb) {
+            cb(false, topic, qos, packet_id);
+        }
     }
 
-    conn_->close();
-    if (on_close_cb_) on_close_cb_();
+    notify_closed_once();
 }
 
 inline void mqtt_client::schedule_dedup_cleanup() {
@@ -725,6 +731,50 @@ inline void mqtt_client::schedule_dedup_cleanup() {
         if (ec) return;
         recently_seen_publish_ids_.clear();
     });
+}
+
+inline void mqtt_client::notify_closed_once() {
+    if (closed_) return;
+    closed_ = true;
+
+    cancel_ping_timer();
+    if (dedup_cleanup_timer_) {
+        asio::error_code ec;
+        dedup_cleanup_timer_->cancel(ec);
+    }
+
+    for (auto& kv : pending_publishes_) {
+        if (kv.second.callback) {
+            kv.second.callback(false, kv.second.topic, kv.second.qos, kv.first);
+        }
+        if (kv.second.timer) {
+            asio::error_code ec;
+            kv.second.timer->cancel(ec);
+        }
+    }
+    pending_publishes_.clear();
+
+    for (auto& kv : pending_pubrecs_) {
+        if (kv.second.timer) {
+            asio::error_code ec;
+            kv.second.timer->cancel(ec);
+        }
+    }
+    pending_pubrecs_.clear();
+
+    for (auto& kv : pending_subscribes_) {
+        subscribe_cb cb = kv.second.second;
+        const auto& filters = kv.second.first;
+        if (cb) {
+            for (const auto& f : filters) {
+                cb(false, f.first, 0);
+            }
+        }
+    }
+    pending_subscribes_.clear();
+
+    conn_->close();
+    if (on_close_cb_) on_close_cb_();
 }
 
 }  // namespace litemqtt

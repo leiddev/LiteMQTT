@@ -37,6 +37,7 @@ public:
     void async_connect(const std::string& host, uint16_t port, connect_handler handler);
     void async_read_packet(read_handler handler);
     void async_write_packet(const std::vector<uint8_t>& data, write_handler handler);
+    void mark_connected();
     void close();
 
     void set_close_handler(close_handler handler) {
@@ -210,6 +211,10 @@ inline void connection::async_write_packet(const std::vector<uint8_t>& data, wri
         [this, self, handler](const asio::error_code& ec, std::size_t /*bytes*/) {
             handler(ec);
         });
+}
+
+inline void connection::mark_connected() {
+    state_ = connection_state::connected;
 }
 
 inline void connection::close() {
