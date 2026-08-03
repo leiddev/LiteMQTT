@@ -511,6 +511,21 @@ inline void mqtt_client::async_publish_impl(const std::string& topic, const std:
     }
 
     uint16_t packet_id = acquire_packet_id();
+    if (packet_id == 0) {
+        // All packet IDs exhausted
+        if (callback) callback(false, topic, qos, 0);
+        return;
+    }
+
+    // Backpressure: reject new publishes if pending queue is full
+    constexpr std::size_t kMaxPendingPublishes = 1000;
+    if (pending_publishes_.size() >= kMaxPendingPublishes) {
+        std::cerr << "async_publish: backpressure limit reached (pending="
+                  << pending_publishes_.size() << ")" << std::endl;
+        if (callback) callback(false, topic, qos, 0);
+        return;
+    }
+
     pending_publish entry;
     entry.topic = topic;
     entry.qos = qos;
@@ -543,6 +558,11 @@ inline void mqtt_client::async_subscribe_impl(const std::string& topic, uint8_t 
     }
 
     uint16_t packet_id = acquire_packet_id();
+    if (packet_id == 0) {
+        // All packet IDs exhausted
+        if (callback) callback(false, topic, 0);
+        return;
+    }
 
     subscribe_packet pkt;
     pkt.packet_id = packet_id;
@@ -574,22 +594,28 @@ inline void mqtt_client::on_publish(publish_cb callback) { on_publish_cb_ = std:
 
 inline connection_state mqtt_client::state() const { return conn_->state(); }
 
-// MUST be called on the io_context thread that owns the pending_* maps.
+// Must be called on the io_context thread that owns the pending_* maps.
+// Returns 0 if all packet IDs are exhausted (all 65535 IDs are in use).
 // async_publish / async_subscribe enforce this via asio::post.
 inline uint16_t mqtt_client::acquire_packet_id() {
     uint16_t start = next_packet_id_;
-    do {
+    for (;;) {
         ++next_packet_id_;
         if (next_packet_id_ == 0) {
-            ++next_packet_id_;
+            ++next_packet_id_;  // Skip reserved value 0
         }
         if (next_packet_id_ == start) {
-            break;
+            // All packet IDs exhausted, trigger connection close
+            std::cerr << "acquire_packet_id: all packet IDs exhausted" << std::endl;
+            notify_closed_once();
+            return 0;
         }
-    } while (pending_publishes_.count(next_packet_id_) ||
-             pending_subscribes_.count(next_packet_id_) ||
-             pending_pubrecs_.count(next_packet_id_));
-    return next_packet_id_;
+        if (!pending_publishes_.count(next_packet_id_) &&
+            !pending_subscribes_.count(next_packet_id_) &&
+            !pending_pubrecs_.count(next_packet_id_)) {
+            return next_packet_id_;
+        }
+    }
 }
 
 inline void mqtt_client::send_publish_entry(uint16_t packet_id) {
