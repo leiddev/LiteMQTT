@@ -70,6 +70,9 @@ private:
 
     uint16_t acquire_packet_id();
     void send_publish_entry(uint16_t packet_id);
+    void async_publish_impl(const std::string& topic, const std::string& payload,
+                            uint8_t qos, publish_cb callback);
+    void async_subscribe_impl(const std::string& topic, uint8_t qos, subscribe_cb callback);
     void send_pubrel(uint16_t packet_id);
     void arm_publish_retry_timer(uint16_t packet_id);
     void arm_pubrec_retry_timer(uint16_t packet_id);
@@ -473,6 +476,14 @@ inline void mqtt_client::async_disconnect() {
 
 inline void mqtt_client::async_publish(const std::string& topic, const std::string& payload,
                                         uint8_t qos, publish_cb callback) {
+    auto self = shared_from_this();
+    asio::post(io_, [self, topic, payload, qos, callback = std::move(callback)]() mutable {
+        self->async_publish_impl(topic, payload, qos, std::move(callback));
+    });
+}
+
+inline void mqtt_client::async_publish_impl(const std::string& topic, const std::string& payload,
+                                             uint8_t qos, publish_cb callback) {
     if (closed_) {
         if (callback) callback(false, topic, qos, 0);
         return;
@@ -513,6 +524,13 @@ inline void mqtt_client::async_publish(const std::string& topic, const std::stri
 }
 
 inline void mqtt_client::async_subscribe(const std::string& topic, uint8_t qos, subscribe_cb callback) {
+    auto self = shared_from_this();
+    asio::post(io_, [self, topic, qos, callback = std::move(callback)]() mutable {
+        self->async_subscribe_impl(topic, qos, std::move(callback));
+    });
+}
+
+inline void mqtt_client::async_subscribe_impl(const std::string& topic, uint8_t qos, subscribe_cb callback) {
     if (closed_) {
         if (callback) callback(false, topic, 0);
         return;
@@ -556,6 +574,8 @@ inline void mqtt_client::on_publish(publish_cb callback) { on_publish_cb_ = std:
 
 inline connection_state mqtt_client::state() const { return conn_->state(); }
 
+// MUST be called on the io_context thread that owns the pending_* maps.
+// async_publish / async_subscribe enforce this via asio::post.
 inline uint16_t mqtt_client::acquire_packet_id() {
     uint16_t start = next_packet_id_;
     do {
