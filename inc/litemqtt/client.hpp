@@ -7,7 +7,6 @@
 #include <map>
 #include <memory>
 #include <string>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -79,7 +78,6 @@ private:
     void cancel_publish_retry_timer(uint16_t packet_id);
     void finish_publish_success(uint16_t packet_id);
     void finish_publish_failure(uint16_t packet_id);
-    void schedule_dedup_cleanup();
     void notify_closed_once();
 
 public:
@@ -163,9 +161,6 @@ private:
     std::map<uint16_t, pending_publish> pending_publishes_;
     std::map<uint16_t, pending_pubrec> pending_pubrecs_;
 
-    std::unordered_set<uint16_t> recently_seen_publish_ids_;
-    std::shared_ptr<asio::steady_timer> dedup_cleanup_timer_;
-
     std::shared_ptr<asio::steady_timer> ping_timer_;
     bool closed_ = false;
 };
@@ -173,7 +168,6 @@ private:
 inline mqtt_client::mqtt_client(asio::io_context& io)
     : io_(io), conn_(std::make_shared<connection>(io)) {
     ping_timer_ = std::make_shared<asio::steady_timer>(io);
-    dedup_cleanup_timer_ = std::make_shared<asio::steady_timer>(io);
 }
 
 inline mqtt_client::~mqtt_client() {
@@ -286,6 +280,7 @@ inline void mqtt_client::handle_connack(const std::vector<uint8_t>& data) {
     connack_packet pkt = connack_packet::parse(data);
     if (pkt.return_code == 0) {
         conn_->mark_connected();
+        closed_ = false;
     }
     if (on_connect_cb_) on_connect_cb_(pkt.return_code == 0, pkt.return_code);
 }
@@ -299,31 +294,23 @@ inline void mqtt_client::handle_publish(const std::vector<uint8_t>& data) {
         return;
     }
 
-    bool is_duplicate = false;
-    if (pkt.qos > 0) {
-        auto inserted = recently_seen_publish_ids_.insert(pkt.packet_id);
-        is_duplicate = !inserted.second;
-        if (recently_seen_publish_ids_.size() == 1) {
-            schedule_dedup_cleanup();
-        }
-    }
-
-    if (!is_duplicate) {
-        uint16_t message_id = (pkt.qos == 0) ? 0 : pkt.packet_id;
-        if (on_message_cb_) on_message_cb_(pkt.topic_name, pkt.payload, pkt.qos, message_id);
-    }
+    uint16_t message_id = (pkt.qos == 0) ? 0 : pkt.packet_id;
+    if (on_message_cb_) on_message_cb_(pkt.topic_name, pkt.payload, pkt.qos, message_id);
 
     if (pkt.qos == 1) {
         puback_packet puback;
         puback.packet_id = pkt.packet_id;
         auto self = shared_from_this();
-        conn_->async_write_packet(puback.serialize(), [self](const asio::error_code&) {});
+        conn_->async_write_packet(puback.serialize(), [self](const asio::error_code& ec) {
+            if (ec) self->notify_closed_once();
+        });
     } else if (pkt.qos == 2) {
-        // QoS 2: respond with PUBREC
         pubrec_packet pubrec;
         pubrec.packet_id = pkt.packet_id;
         auto self = shared_from_this();
-        conn_->async_write_packet(pubrec.serialize(), [self](const asio::error_code&) {});
+        conn_->async_write_packet(pubrec.serialize(), [self](const asio::error_code& ec) {
+            if (ec) self->notify_closed_once();
+        });
     }
 }
 
@@ -407,7 +394,9 @@ inline void mqtt_client::handle_pubrel(const std::vector<uint8_t>& data) {
     pubcomp_packet pubcomp;
     pubcomp.packet_id = pkt.packet_id;
     auto self = shared_from_this();
-    conn_->async_write_packet(pubcomp.serialize(), [self](const asio::error_code&) {});
+    conn_->async_write_packet(pubcomp.serialize(), [self](const asio::error_code& ec) {
+        if (ec) self->notify_closed_once();
+    });
 }
 
 inline void mqtt_client::handle_pubcomp(const std::vector<uint8_t>& data) {
@@ -769,25 +758,11 @@ inline void mqtt_client::finish_publish_failure(uint16_t packet_id) {
     notify_closed_once();
 }
 
-inline void mqtt_client::schedule_dedup_cleanup() {
-    if (!dedup_cleanup_timer_) return;
-    dedup_cleanup_timer_->expires_after(std::chrono::seconds(120));
-    auto self = shared_from_this();
-    dedup_cleanup_timer_->async_wait([this, self](const asio::error_code& ec) {
-        if (ec) return;
-        recently_seen_publish_ids_.clear();
-    });
-}
-
 inline void mqtt_client::notify_closed_once() {
     if (closed_) return;
     closed_ = true;
 
     cancel_ping_timer();
-    if (dedup_cleanup_timer_) {
-        asio::error_code ec;
-        dedup_cleanup_timer_->cancel(ec);
-    }
 
     for (auto& kv : pending_publishes_) {
         if (kv.second.callback) {
