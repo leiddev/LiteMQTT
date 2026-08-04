@@ -669,7 +669,7 @@ inline void mqtt_client::arm_pubrec_retry_timer(uint16_t packet_id) {
     auto rec_it = pending_pubrecs_.find(packet_id);
     if (rec_it == pending_pubrecs_.end()) return;
 
-    auto timer = rec_it->second.timer;
+    auto& timer = rec_it->second.timer;
     timer->expires_after(std::chrono::seconds(5));
 
     auto self = shared_from_this();
@@ -696,7 +696,7 @@ inline void mqtt_client::arm_publish_retry_timer(uint16_t packet_id) {
     auto it = pending_publishes_.find(packet_id);
     if (it == pending_publishes_.end()) return;
 
-    auto timer = it->second.timer;
+    auto& timer = it->second.timer;
     timer->expires_after(std::chrono::seconds(5));
 
     auto self = shared_from_this();
