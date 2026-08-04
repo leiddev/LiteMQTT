@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -13,7 +14,7 @@ namespace {
 std::atomic<bool> g_should_exit{false};
 }
 
-void signal_handler(int /*signal*/) {
+static void signal_handler(int /*signal*/) {
     g_should_exit = true;
 }
 
@@ -63,16 +64,7 @@ int main(int argc, char* argv[]) {
         client->set_password(password);
     }
 
-        client->on_connect([client, subscribe_topic, publish_topic, payload](bool success, uint8_t rc) {
-        if (!success) {
-            std::cerr << "Connection failed, return code: " << static_cast<int>(rc) << std::endl;
-            g_should_exit = true;
-            return;
-        }
-
-        std::cout << "Connected to broker" << std::endl;
-
-        // Subscribe with callback
+    auto do_subscribe = [client, &subscribe_topic]() {
         client->async_subscribe(subscribe_topic, 2, [](bool success, std::string topic, uint8_t qos) {
             if (success) {
                 std::cout << "Subscribed to: " << topic << " with QoS " << static_cast<int>(qos) << std::endl;
@@ -80,8 +72,48 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Failed to subscribe to: " << topic << std::endl;
             }
         });
+    };
 
-        // Publish with callback (QoS 1 for delivery confirmation)
+    constexpr int max_reconnect_attempts = 10;
+    constexpr int base_reconnect_delay_ms = 1000;
+
+    int reconnect_attempts = 0;
+    bool initial_connect = true;
+
+    auto do_reconnect = [client, host, port, &reconnect_attempts,
+                    max_reconnect_attempts, base_reconnect_delay_ms]() {
+        if (reconnect_attempts >= max_reconnect_attempts) {
+            std::cerr << "Max reconnect attempts reached, exiting." << std::endl;
+            g_should_exit = true;
+            return;
+        }
+
+        int delay_ms = std::min(base_reconnect_delay_ms * (1 << reconnect_attempts), 30000);
+        reconnect_attempts++;
+        std::cout << "Reconnecting in " << delay_ms << "ms (attempt " << reconnect_attempts << "/" << max_reconnect_attempts << ")..." << std::endl;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        client->async_connect(host, port);
+    };
+
+    client->on_connect([client, subscribe_topic, publish_topic, payload,
+                        &initial_connect, &reconnect_attempts, do_subscribe, do_reconnect](bool success, uint8_t rc) {
+        if (!success) {
+            std::cerr << "Connection failed, return code: " << static_cast<int>(rc) << std::endl;
+            if (initial_connect) {
+                g_should_exit = true;
+                return;
+            }
+            do_reconnect();
+            return;
+        }
+
+        std::cout << "Connected to broker" << std::endl;
+        reconnect_attempts = 0;
+        initial_connect = false;
+
+        do_subscribe();
+
         client->async_publish(publish_topic, payload, 1, [](bool success, std::string topic, uint8_t qos, uint16_t packet_id) {
             if (success) {
                 std::cout << "Published message id=" << packet_id << " on: " << topic << " (QoS " << static_cast<int>(qos) << ")" << std::endl;
@@ -95,9 +127,10 @@ int main(int argc, char* argv[]) {
         std::cout << "Received message id=" << packet_id << " on [" << topic << "] (QoS " << static_cast<int>(qos) << "): " << msg << std::endl;
     });
 
-    client->on_close([]() {
+    client->on_close([do_reconnect]() {
         std::cout << "Connection closed" << std::endl;
-        g_should_exit = true;
+        if (g_should_exit) return;
+        do_reconnect();
     });
 
     client->async_connect(host, port);
@@ -115,7 +148,7 @@ int main(int argc, char* argv[]) {
     });
 
     while (!g_should_exit) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
         if (client->state() == litemqtt::connection_state::connected) {
             client->async_publish(publish_topic, payload, 2);
         }
