@@ -21,6 +21,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES MSVC)
     add_compile_options(/execution-charset:utf-8)
     add_compile_options(-D_CRT_SECURE_NO_WARNINGS)
     add_compile_options(-D_WINSOCK_DEPRECATED_NO_WARNINGS)
+    add_compile_options(-DNOMINMAX) # Prevent Windows.h from defining min/max macros
 endif()
 
 target_include_directories(LiteMQTTDemo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/inc)
