@@ -563,11 +563,17 @@ inline void mqtt_client::async_subscribe_impl(const std::string& topic, uint8_t 
     auto self = shared_from_this();
     conn_->async_write_packet(pkt.serialize(),
         [this, self, packet_id](const asio::error_code& ec) {
-            if (!ec) return;
             auto it = pending_subscribes_.find(packet_id);
             if (it == pending_subscribes_.end()) return;
             const auto& filters = it->second.first;
             subscribe_cb cb = it->second.second;
+            if (!ec) {
+                if (!cb) return;
+                for (const auto& f : filters) {
+                    cb(true, f.first, f.second);
+                }
+                return;
+            }
             pending_subscribes_.erase(it);
             if (!cb) return;
             for (const auto& f : filters) {
