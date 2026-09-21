@@ -1,6 +1,7 @@
 #ifndef LITEMQTT_HELPER_HPP
 #define LITEMQTT_HELPER_HPP
 
+#include <iostream>
 #include <atomic>
 #include <chrono>
 #include <cstdint>

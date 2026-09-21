@@ -1,6 +1,7 @@
 #ifndef LITEMQTT_CLIENT_HPP
 #define LITEMQTT_CLIENT_HPP
 
+#include <iostream>
 #include <cstdint>
 #include <chrono>
 #include <functional>
