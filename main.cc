@@ -53,6 +53,7 @@ int main(int argc, char* argv[]) {
     auto mqtt = std::make_shared<litemqtt::mqtt_helper>(host, port, client_id);
     mqtt->set_keep_alive(60);
     mqtt->set_clean_session(true);
+    mqtt->set_reconnect_config(-1, 3000);
     if (!username.empty() && !password.empty()) {
         mqtt->set_credentials(username, password);
     }

@@ -265,10 +265,10 @@ inline void mqtt_helper::setup_callbacks() {
         if (!success) {
             std::cerr << "[mqtt_helper] Connection failed, return code: "
                     << static_cast<int>(rc) << std::endl;
-            if (self->initial_connect_.load()) {
-                self->should_reconnect_.store(false);
-                return;
-            }
+            //if (self->initial_connect_.load()) {
+            //    self->should_reconnect_.store(false);
+            //    return;
+            //}
             self->do_reconnect();
             return;
         }
@@ -304,14 +304,20 @@ inline void mqtt_helper::do_reconnect() {
     }
 
     int attempts = reconnect_attempts_.load();
-    if (attempts >= max_reconnect_attempts_) {
+    if ((max_reconnect_attempts_ != -1) && (attempts >= max_reconnect_attempts_)) {
         std::cerr << "[mqtt_helper] Max reconnect attempts reached ("
                   << max_reconnect_attempts_ << "), giving up" << std::endl;
         should_reconnect_.store(false);
         return;
     }
 
-    int delay_ms = std::min(base_reconnect_delay_ms_ * (1 << attempts), 30000);
+    int delay_ms;
+    if (max_reconnect_attempts_ == -1) {
+        delay_ms = base_reconnect_delay_ms_;
+    } else {
+        delay_ms = std::min(base_reconnect_delay_ms_ * (1 << attempts), 30000);
+    }
+    
     reconnect_attempts_.fetch_add(1);
 
     std::cout << "[mqtt_helper] Reconnecting in " << delay_ms << "ms (attempt "
