@@ -41,6 +41,17 @@ int main(int argc, char* argv[]) {
 
     std::signal(SIGINT, signal_handler);
 
+    // Option A: take over the library logging completely (e.g. route it into
+    // spdlog / glog / Qt's qDebug).  The handler is invoked from the asio
+    // io_context thread, so it must be thread-safe.
+    litemqtt::set_log_handler([](const litemqtt::log_record& record) {
+        std::cout << "[demo][" << litemqtt::to_string(record.level) << "] " << record.message
+                  << " (" << record.file << ":" << record.line << ")" << std::endl;
+    });
+
+    // Option B: only raise the severity threshold, keep the built-in sink.
+    // litemqtt::set_log_level(litemqtt::log_level::info);
+
     std::cout << "LiteMQTT Demo Client" << std::endl;
     std::cout << "  Host: " << host << ":" << port << std::endl;
     std::cout << "  Client ID: " << client_id << std::endl;
@@ -54,6 +65,14 @@ int main(int argc, char* argv[]) {
     mqtt->set_keep_alive(60);
     mqtt->set_clean_session(true);
     mqtt->set_reconnect_config(-1, 3000);
+
+    // Option C: per-instance sink.  It takes precedence over the global handler
+    // installed above, for this helper and for the mqtt_client it owns; pass an
+    // empty handler to fall back to the global one again:
+    // mqtt->set_log_handler([](const litemqtt::log_record& record) {
+    //     my_logger::write(client_id, record.level, record.message);
+    // });
+
     if (!username.empty() && !password.empty()) {
         mqtt->set_credentials(username, password);
     }

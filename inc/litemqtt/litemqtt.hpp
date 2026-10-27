@@ -4,6 +4,7 @@
 #include "client.hpp"
 #include "connection.hpp"
 #include "error.hpp"
+#include "log.hpp"
 #include "packet_type.hpp"
 #include "buffer_reader.hpp"
 #include "buffer_writer.hpp"

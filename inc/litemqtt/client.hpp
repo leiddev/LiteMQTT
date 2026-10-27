@@ -1,7 +1,6 @@
 #ifndef LITEMQTT_CLIENT_HPP
 #define LITEMQTT_CLIENT_HPP
 
-#include <iostream>
 #include <cstdint>
 #include <chrono>
 #include <functional>
@@ -15,6 +14,7 @@
 
 #include "buffer_reader.hpp"
 #include "connection.hpp"
+#include "log.hpp"
 #include "packets.hpp"
 #include "packet_type.hpp"
 
@@ -50,6 +50,18 @@ public:
     void on_close(close_cb callback);
     void on_subscribe(subscribe_cb callback);
     void on_publish(publish_cb callback);
+
+    /// Per-client log sink.  Takes precedence over the process wide handler
+    /// installed with litemqtt::set_log_handler() for records emitted by this
+    /// client.  Pass an empty handler to fall back to the global one.  Safe to
+    /// call from any thread, also while the client is running.
+    void set_log_handler(log_handler handler) { log_channel_.set_handler(std::move(handler)); }
+
+    /// Currently installed per-client sink (empty when the global one is used).
+    log_handler get_log_handler() const { return log_channel_.handler(); }
+
+    /// True when this client has its own sink installed.
+    bool has_log_handler() const { return log_channel_.has_handler(); }
 
     connection_state state() const;
 
@@ -164,6 +176,8 @@ private:
 
     std::shared_ptr<asio::steady_timer> ping_timer_;
     bool closed_ = false;
+
+    detail::log_channel log_channel_;
 };
 
 inline mqtt_client::mqtt_client(asio::io_context& io)
@@ -201,7 +215,8 @@ inline void mqtt_client::async_connect(const std::string& host, uint16_t port, c
     conn_->async_connect(host, port,
         [this, self](const asio::error_code& ec) {
             if (ec) {
-                std::cerr << "Socket connect failed: " << ec.message() << std::endl;
+                LITEMQTT_LOG_TO(log_channel_, log_level::error)
+                    << "Socket connect failed: " << ec.message();
                 if (on_connect_cb_) on_connect_cb_(false, 255);
                 return;
             }
@@ -290,7 +305,8 @@ inline void mqtt_client::handle_publish(const std::vector<uint8_t>& data) {
     publish_packet pkt = publish_packet::parse(data);
 
     if (pkt.qos > 2) {
-        std::cerr << "Protocol error: PUBLISH with invalid QoS " << static_cast<int>(pkt.qos) << std::endl;
+        LITEMQTT_LOG_TO(log_channel_, log_level::error)
+            << "Protocol error: PUBLISH with invalid QoS " << static_cast<int>(pkt.qos);
         notify_closed_once();
         return;
     }
@@ -480,7 +496,8 @@ inline void mqtt_client::async_publish_impl(const std::string& topic, const std:
     }
 
     if (qos > 2) {
-        std::cerr << "async_publish: invalid QoS " << static_cast<int>(qos) << std::endl;
+        LITEMQTT_LOG_TO(log_channel_, log_level::error)
+            << "async_publish: invalid QoS " << static_cast<int>(qos);
         if (callback) callback(false, topic, qos, 0);
         return;
     }
@@ -510,8 +527,9 @@ inline void mqtt_client::async_publish_impl(const std::string& topic, const std:
     // Backpressure: reject new publishes if pending queue is full
     constexpr std::size_t kMaxPendingPublishes = 1000;
     if (pending_publishes_.size() >= kMaxPendingPublishes) {
-        std::cerr << "async_publish: backpressure limit reached (pending="
-                  << pending_publishes_.size() << ")" << std::endl;
+        LITEMQTT_LOG_TO(log_channel_, log_level::warn)
+            << "async_publish: backpressure limit reached (pending="
+            << pending_publishes_.size() << ")";
         if (callback) callback(false, topic, qos, 0);
         return;
     }
@@ -542,7 +560,8 @@ inline void mqtt_client::async_subscribe_impl(const std::string& topic, uint8_t 
     }
 
     if (qos > 2) {
-        std::cerr << "async_subscribe: invalid QoS " << static_cast<int>(qos) << std::endl;
+        LITEMQTT_LOG_TO(log_channel_, log_level::error)
+            << "async_subscribe: invalid QoS " << static_cast<int>(qos);
         if (callback) callback(false, topic, 0);
         return;
     }
@@ -602,7 +621,8 @@ inline uint16_t mqtt_client::acquire_packet_id() {
         }
         if (next_packet_id_ == start) {
             // All packet IDs exhausted, trigger connection close
-            std::cerr << "acquire_packet_id: all packet IDs exhausted" << std::endl;
+            LITEMQTT_LOG_TO(log_channel_, log_level::error)
+                << "acquire_packet_id: all packet IDs exhausted";
             notify_closed_once();
             return 0;
         }

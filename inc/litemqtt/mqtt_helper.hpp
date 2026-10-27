@@ -1,7 +1,6 @@
 #ifndef LITEMQTT_HELPER_HPP
 #define LITEMQTT_HELPER_HPP
 
-#include <iostream>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -15,6 +14,7 @@
 #include <asio.hpp>
 
 #include "client.hpp"
+#include "log.hpp"
 
 namespace litemqtt {
 
@@ -60,6 +60,18 @@ public:
     bool is_connected() const;
     bool is_running() const;
 
+    /// Per-helper log sink.  Takes precedence over the process wide handler
+    /// installed with litemqtt::set_log_handler() for records emitted by this
+    /// helper (and by the mqtt_client it owns).  Pass an empty handler to fall
+    /// back to the global one.  Safe to call from any thread.
+    void set_log_handler(log_handler handler);
+
+    /// Currently installed per-helper sink (empty when the global one is used).
+    log_handler get_log_handler() const { return log_channel_.handler(); }
+
+    /// True when this helper has its own sink installed.
+    bool has_log_handler() const { return log_channel_.has_handler(); }
+
 private:
     void init_client();
     void start_io_thread();
@@ -96,6 +108,9 @@ private:
 
     message_callback message_callback_;
     std::mutex callback_mutex_;
+
+    detail::log_channel log_channel_;
+    std::mutex log_handler_mutex_;  ///< Guards creation of client_ vs. log config
 };
 
 inline mqtt_helper::mqtt_helper(const std::string& host, uint16_t port,
@@ -128,6 +143,17 @@ inline void mqtt_helper::set_reconnect_config(int max_attempts,
                                               int base_delay_ms) {
     max_reconnect_attempts_ = max_attempts;
     base_reconnect_delay_ms_ = base_delay_ms;
+}
+
+inline void mqtt_helper::set_log_handler(log_handler handler) {
+    std::lock_guard<std::mutex> lock(log_handler_mutex_);
+    // Keep a copy for the helper's own records, hand the original to the client
+    // so that transport level records (connect failures, protocol errors, ...)
+    // are routed to the same backend.
+    log_channel_.set_handler(handler);
+    if (client_) {
+        client_->set_log_handler(std::move(handler));
+    }
 }
 
 inline void mqtt_helper::on_message(message_callback callback) {
@@ -208,15 +234,23 @@ inline bool mqtt_helper::is_running() const {
 }
 
 inline void mqtt_helper::init_client() {
-    client_ = std::make_shared<mqtt_client>(io_);
-    client_->set_client_id(client_id_);
-    client_->set_keep_alive(keep_alive_seconds_);
-    client_->set_clean_session(clean_session_);
+    auto client = std::make_shared<mqtt_client>(io_);
+    client->set_client_id(client_id_);
+    client->set_keep_alive(keep_alive_seconds_);
+    client->set_clean_session(clean_session_);
     if (!username_.empty()) {
-        client_->set_username(username_);
+        client->set_username(username_);
     }
     if (!password_.empty()) {
-        client_->set_password(password_);
+        client->set_password(password_);
+    }
+    {
+        std::lock_guard<std::mutex> lock(log_handler_mutex_);
+        // Propagate a handler installed before start() to the fresh client.
+        if (log_channel_.has_handler()) {
+            client->set_log_handler(log_channel_.handler());
+        }
+        client_ = std::move(client);
     }
 }
 
@@ -226,11 +260,14 @@ inline void mqtt_helper::start_io_thread() {
         try {
             io_.run();
         } catch (const std::exception& e) {
-            std::cerr << "[mqtt_helper] io_context exception: " << e.what() << std::endl;
+            LITEMQTT_LOG_TO(log_channel_, log_level::error)
+                << "[mqtt_helper] io_context exception: " << e.what();
         } catch (...) {
-            std::cerr << "[mqtt_helper] io_context unknown exception" << std::endl;
+            LITEMQTT_LOG_TO(log_channel_, log_level::error)
+                << "[mqtt_helper] io_context unknown exception";
         }
-        std::cout << "[mqtt_helper] io_context thread exiting" << std::endl;
+        LITEMQTT_LOG_TO(log_channel_, log_level::debug)
+            << "[mqtt_helper] io_context thread exiting";
     });
 }
 
@@ -254,17 +291,20 @@ inline void mqtt_helper::setup_callbacks() {
     });
 
     client_->on_close([self]() {
-        std::cout << "[mqtt_helper] Connection closed" << std::endl;
+        LITEMQTT_LOG_TO(self->log_channel_, log_level::info)
+            << "[mqtt_helper] Connection closed";
         if (self->should_reconnect_.load() && !self->user_stopped_.load()) {
             self->do_reconnect();
         }
     });
 
     client_->on_connect([self](bool success, uint8_t rc) {
-        std::cout << "[mqtt_helper] Connection callback fired: success=" << success << ", rc=" << static_cast<int>(rc) << std::endl;
+        LITEMQTT_LOG_TO(self->log_channel_, log_level::debug)
+            << "[mqtt_helper] Connection callback fired: success=" << success
+            << ", rc=" << static_cast<int>(rc);
         if (!success) {
-            std::cerr << "[mqtt_helper] Connection failed, return code: "
-                    << static_cast<int>(rc) << std::endl;
+            LITEMQTT_LOG_TO(self->log_channel_, log_level::error)
+                << "[mqtt_helper] Connection failed, return code: " << static_cast<int>(rc);
             //if (self->initial_connect_.load()) {
             //    self->should_reconnect_.store(false);
             //    return;
@@ -273,7 +313,8 @@ inline void mqtt_helper::setup_callbacks() {
             return;
         }
 
-        std::cout << "[mqtt_helper] Connected to broker" << std::endl;
+        LITEMQTT_LOG_TO(self->log_channel_, log_level::info)
+            << "[mqtt_helper] Connected to broker";
         self->reconnect_attempts_.store(0);
         self->initial_connect_.store(false);
 
@@ -289,11 +330,12 @@ inline void mqtt_helper::setup_callbacks() {
 
 inline void mqtt_helper::do_connect() {
     if (!client_) {
-        std::cerr << "[mqtt_helper] client_ is null!" << std::endl;
+        LITEMQTT_LOG_TO(log_channel_, log_level::error) << "[mqtt_helper] client_ is null!";
         return;
     }
 
-    std::cout << "[mqtt_helper] Initiating connection to " << host_ << ":" << port_ << "..." << std::endl;
+    LITEMQTT_LOG_TO(log_channel_, log_level::info)
+        << "[mqtt_helper] Initiating connection to " << host_ << ":" << port_ << "...";
 
     client_->async_connect(host_, port_);
 }
@@ -305,8 +347,9 @@ inline void mqtt_helper::do_reconnect() {
 
     int attempts = reconnect_attempts_.load();
     if ((max_reconnect_attempts_ != -1) && (attempts >= max_reconnect_attempts_)) {
-        std::cerr << "[mqtt_helper] Max reconnect attempts reached ("
-                  << max_reconnect_attempts_ << "), giving up" << std::endl;
+        LITEMQTT_LOG_TO(log_channel_, log_level::warn)
+            << "[mqtt_helper] Max reconnect attempts reached (" << max_reconnect_attempts_
+            << "), giving up";
         should_reconnect_.store(false);
         return;
     }
@@ -320,8 +363,9 @@ inline void mqtt_helper::do_reconnect() {
     
     reconnect_attempts_.fetch_add(1);
 
-    std::cout << "[mqtt_helper] Reconnecting in " << delay_ms << "ms (attempt "
-              << (attempts + 1) << "/" << max_reconnect_attempts_ << ")..." << std::endl;
+    LITEMQTT_LOG_TO(log_channel_, log_level::info)
+        << "[mqtt_helper] Reconnecting in " << delay_ms << "ms (attempt " << (attempts + 1) << "/"
+        << max_reconnect_attempts_ << ")...";
 
     std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
     if (should_reconnect_.load() && !user_stopped_.load()) {
