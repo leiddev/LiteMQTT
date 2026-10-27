@@ -137,22 +137,60 @@ TEST(MqttClientTest, SubackFailureCodeMarksTopicFailed) {
     EXPECT_EQ(std::get<2>(calls[1]), 0);
 }
 
-TEST(MqttClientTest, InboundPublishDedup) {
+TEST(MqttClientTest, InboundPublishQos1IsAtLeastOnce) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+
+    std::vector<std::tuple<std::string, uint8_t, uint16_t>> delivered;
+    client->on_message(
+        [&](std::string topic, std::string, uint8_t qos, uint16_t id) {
+            delivered.emplace_back(topic, qos, id);
+        });
+
+    // QoS 1 is "at least once" (MQTT 3.1.1 section 4.3.2): every PUBLISH is
+    // acknowledged and the broker may retransmit it with DUP=1.  The client
+    // deliberately does not deduplicate locally ("trust broker QoS handshake",
+    // see 88d09da), so a retransmission is delivered again.
+    client->handle_publish(build_publish_bytes(3, "t/a", "payload", 1, false));
+    ASSERT_EQ(delivered.size(), 1u);
+    EXPECT_EQ(std::get<0>(delivered[0]), "t/a");
+    EXPECT_EQ(std::get<1>(delivered[0]), 1);
+    EXPECT_EQ(std::get<2>(delivered[0]), 3);
+
+    // DUP retransmission of the same packet id: delivered again.
+    client->handle_publish(build_publish_bytes(3, "t/a", "payload", 1, true));
+    EXPECT_EQ(delivered.size(), 2u);
+
+    // A new message (different packet id) is independent of the previous one.
+    client->handle_publish(build_publish_bytes(4, "t/a", "payload", 1, false));
+    ASSERT_EQ(delivered.size(), 3u);
+    EXPECT_EQ(std::get<2>(delivered[2]), 4);
+}
+
+TEST(MqttClientTest, InboundPublishQos2DeliversOnPublishOnly) {
     asio::io_context io;
     auto client = make_test_client(io);
 
     int seen = 0;
-    client->on_message([&](std::string, std::string, uint8_t, uint16_t) {
+    uint8_t seen_qos = 255;
+    uint16_t seen_id = 0;
+    client->on_message([&](std::string, std::string, uint8_t qos, uint16_t id) {
         ++seen;
+        seen_qos = qos;
+        seen_id = id;
     });
 
-    client->handle_publish(build_publish_bytes(3, "t/a", "payload", 1, false));
+    // A QoS 2 message is delivered when the PUBLISH arrives (PUBREC is replied
+    // right away); the following PUBREL only completes the handshake with
+    // PUBCOMP and must not dispatch the message a second time.
+    client->handle_publish(build_publish_bytes(21, "t/b", "p2", 2, false));
     EXPECT_EQ(seen, 1);
+    EXPECT_EQ(seen_qos, 2);
+    EXPECT_EQ(seen_id, 21);
 
-    client->handle_publish(build_publish_bytes(3, "t/a", "payload", 1, true));
-    EXPECT_EQ(seen, 1);
-
-    client->handle_publish(build_publish_bytes(3, "t/a", "payload", 1, false));
+    pubrel_packet pubrel;
+    pubrel.packet_id = 21;
+    client->handle_pubrel(pubrel.serialize());
     EXPECT_EQ(seen, 1);
 }
 
