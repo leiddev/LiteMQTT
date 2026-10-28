@@ -36,6 +36,10 @@ public:
     void set_clean_session(bool clean);
     void set_username(const std::string& username);
     void set_password(const std::string& password);
+    /// How long a connect attempt may take -- TCP connect plus the CONNACK wait --
+    /// before it is abandoned and reported through the connect callback as failed.
+    /// 0 disables the timeout.  Default 10000 ms; set it before async_connect().
+    void set_connect_timeout(int ms);
 
     void async_connect(const std::string& host, uint16_t port,
                         connect_cb callback = nullptr);
@@ -85,6 +89,7 @@ public:
 private:
     void send_connect_packet();
     void handle_connack(const std::vector<uint8_t>& data);
+    void handle_connect_timeout();
     void start_read_loop();
     void schedule_pingreq();
     void cancel_ping_timer();
@@ -184,6 +189,12 @@ private:
     std::map<uint16_t, pending_pubrec> pending_pubrecs_;
 
     std::shared_ptr<asio::steady_timer> ping_timer_;
+    // Bounds the TCP connect *and* the CONNACK wait: a peer that accepts the
+    // socket and then goes silent never completes the handshake, and without this
+    // the session would sit in "handshaking" for as long as the keepalive allows
+    // (forever when keep_alive == 0).
+    std::shared_ptr<asio::steady_timer> connect_timer_;
+    int connect_timeout_ms_ = 10000;
     bool closed_ = false;
 
     detail::log_channel log_channel_;
@@ -192,10 +203,17 @@ private:
 inline mqtt_client::mqtt_client(asio::io_context& io)
     : io_(io), conn_(std::make_shared<connection>(io)) {
     ping_timer_ = std::make_shared<asio::steady_timer>(io);
+    connect_timer_ = std::make_shared<asio::steady_timer>(io);
 }
+
+inline void mqtt_client::set_connect_timeout(int ms) { connect_timeout_ms_ = (ms < 0) ? 0 : ms; }
 
 inline mqtt_client::~mqtt_client() {
     cancel_ping_timer();
+    {
+        asio::error_code ec;
+        connect_timer_->cancel(ec);
+    }
 
     // Cancel all pending pubrec timers
     for (auto it = pending_pubrecs_.begin(); it != pending_pubrecs_.end(); ++it) {
@@ -219,10 +237,31 @@ inline void mqtt_client::async_connect(const std::string& host, uint16_t port, c
     if (callback) {
         on_connect_cb_ = std::move(callback);
     }
+    // A new attempt starts clean: closed_ is what the previous failure left behind,
+    // and the timeout handler *and* the connect completion both consult it.
+    closed_ = false;
+
+    // Covers both halves of the attempt: the TCP connect and the CONNACK wait.
+    // A peer that blackholes the SYN, or accepts the socket and then says nothing,
+    // would otherwise leave the session in "handshaking" until the keepalive
+    // notices (1.5 x keep_alive) -- or forever when keep_alive == 0.
+    if (connect_timeout_ms_ > 0) {
+        auto self = shared_from_this();
+        connect_timer_->expires_after(std::chrono::milliseconds(connect_timeout_ms_));
+        connect_timer_->async_wait([this, self](const asio::error_code& ec) {
+            if (ec) {
+                return;  // cancelled: CONNACK arrived or the session closed
+            }
+            handle_connect_timeout();
+        });
+    }
 
     auto self = shared_from_this();
     conn_->async_connect(host, port,
         [this, self](const asio::error_code& ec) {
+            if (closed_) {
+                return;  // the connect timeout already reported this attempt
+            }
             if (ec) {
                 LITEMQTT_LOG_TO(log_channel_, log_level::error)
                     << "Socket connect failed: " << ec.message();
@@ -231,6 +270,22 @@ inline void mqtt_client::async_connect(const std::string& host, uint16_t port, c
             }
             send_connect_packet();
         });
+}
+
+inline void mqtt_client::handle_connect_timeout() {
+    if (closed_) {
+        return;
+    }
+    LITEMQTT_LOG_TO(log_channel_, log_level::error)
+        << "Connect timed out after " << connect_timeout_ms_
+        << " ms; abandoning this attempt";
+
+    // closed_ first, so the completion of the aborted TCP connect stays quiet.
+    // Report the failure through the connect callback, exactly like a refused
+    // CONNACK: that is what drives the reconnect policy.
+    closed_ = true;
+    conn_->close();
+    if (on_connect_cb_) on_connect_cb_(false, 255);
 }
 
 inline void mqtt_client::send_connect_packet() {
@@ -307,6 +362,13 @@ inline void mqtt_client::handle_packet(const std::vector<uint8_t>& data) {
 }
 
 inline void mqtt_client::handle_connack(const std::vector<uint8_t>& data) {
+    // The handshake is over either way: a late timeout must not kill a session
+    // that just came up.
+    {
+        asio::error_code ignored;
+        connect_timer_->cancel(ignored);
+    }
+
     connack_packet pkt = connack_packet::parse(data);
     if (pkt.return_code == 0) {
         conn_->mark_connected();
@@ -523,14 +585,24 @@ inline void mqtt_client::async_publish(const std::string& topic, const std::stri
 
 inline void mqtt_client::async_publish_impl(const std::string& topic, const std::string& payload,
                                              uint8_t qos, publish_cb callback) {
+    // Argument validation comes first: a bad QoS is a programming error that must
+    // be reported (and logged) no matter what the connection state is.
+    if (qos > 2) {
+        LITEMQTT_LOG_TO(log_channel_, log_level::error)
+            << "async_publish: invalid QoS " << static_cast<int>(qos);
+        if (callback) callback(false, topic, qos, 0);
+        return;
+    }
+
     if (closed_) {
         if (callback) callback(false, topic, qos, 0);
         return;
     }
 
-    if (qos > 2) {
-        LITEMQTT_LOG_TO(log_channel_, log_level::error)
-            << "async_publish: invalid QoS " << static_cast<int>(qos);
+    if (conn_->state() != connection_state::connected) {
+        // Nothing to publish on yet: connecting, waiting for CONNACK or a session
+        // that is already gone.  Report the failure without touching the socket --
+        // a publish must never tear down a connect attempt in progress.
         if (callback) callback(false, topic, qos, 0);
         return;
     }
@@ -823,6 +895,10 @@ inline void mqtt_client::notify_closed_once() {
     closed_ = true;
 
     cancel_ping_timer();
+    {
+        asio::error_code ignored;
+        connect_timer_->cancel(ignored);
+    }
 
     for (auto& kv : pending_publishes_) {
         if (kv.second.callback) {

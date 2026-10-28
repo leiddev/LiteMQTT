@@ -42,6 +42,10 @@ public:
     void set_credentials(const std::string& username, const std::string& password);
     void set_keep_alive(uint16_t seconds);
     void set_clean_session(bool clean);
+    /// Abandon a connect attempt (TCP connect + CONNACK wait) after `ms`
+    /// milliseconds and let the reconnect policy take over; 0 disables it.
+    /// Configure it before start().  Default 10000 ms.
+    void set_connect_timeout(int ms);
     /// Automatic reconnection policy; configure it before start().
     ///   max_attempts == -1  retry forever, always waiting base_delay_ms
     ///                       (no exponential growth)
@@ -116,6 +120,7 @@ private:
     std::string password_;
     uint16_t keep_alive_seconds_ = 60;
     bool clean_session_ = true;
+    int connect_timeout_ms_ = 10000;
 
     int max_reconnect_attempts_ = 10;
     int base_reconnect_delay_ms_ = 1000;
@@ -124,6 +129,8 @@ private:
 
     std::atomic<bool> running_{false};
     std::atomic<bool> should_reconnect_{false};
+    // True while a retry is sitting in reconnect_timer_ (see do_reconnect()).
+    std::atomic<bool> reconnect_pending_{false};
     std::atomic<bool> user_stopped_{false};
 
     asio::io_context io_;
@@ -171,6 +178,10 @@ inline void mqtt_helper::set_keep_alive(uint16_t seconds) {
 
 inline void mqtt_helper::set_clean_session(bool clean) {
     clean_session_ = clean;
+}
+
+inline void mqtt_helper::set_connect_timeout(int ms) {
+    connect_timeout_ms_ = (ms < 0) ? 0 : ms;
 }
 
 inline void mqtt_helper::set_reconnect_config(int max_attempts,
@@ -232,6 +243,12 @@ inline void mqtt_helper::publish(
                        uint16_t packet_id)> callback) {
     auto client = lock_client();
     if (!client) {
+        // Between stop() and start() there is nobody to hand the message to.  Report
+        // it instead of dropping it silently: a publisher loop that waits for the
+        // callback would otherwise stall for good.
+        if (callback) {
+            callback(false, topic, qos, 0);
+        }
         return;
     }
 
@@ -245,6 +262,7 @@ inline void mqtt_helper::start() {
 
     user_stopped_.store(false);
     should_reconnect_.store(true);
+    reconnect_pending_.store(false);
     // A fresh start is a fresh session: an attempt counter left over from a
     // previous run would otherwise make do_reconnect() give up immediately.
     reconnect_attempts_.store(0);
@@ -272,6 +290,7 @@ inline void mqtt_helper::stop() {
     // Cancels a pending backoff wait so that the io thread is not kept alive by
     // a reconnect that is about to be abandoned anyway.
     reconnect_timer_.cancel();
+    reconnect_pending_.store(false);
 
     const bool on_io_thread =
         io_thread_.joinable() && (std::this_thread::get_id() == io_thread_.get_id());
@@ -384,6 +403,7 @@ inline bool mqtt_helper::rearm_reconnect() {
         }
         asio::error_code ec;
         self->reconnect_timer_.cancel(ec);
+        self->reconnect_pending_.store(false);
         self->do_connect();
     });
     return true;
@@ -394,6 +414,7 @@ inline void mqtt_helper::init_client() {
     client->set_client_id(client_id_);
     client->set_keep_alive(keep_alive_seconds_);
     client->set_clean_session(clean_session_);
+    client->set_connect_timeout(connect_timeout_ms_);
     if (!username_.empty()) {
         client->set_username(username_);
     }
@@ -551,12 +572,21 @@ inline void mqtt_helper::do_reconnect() {
         return;
     }
 
+    // One retry at a time: a single failure can be reported by more than one path
+    // (a failed connect callback *and* a close notification, or a publish that
+    // fails while the link is down).  Re-arming the timer for each of them would
+    // count the attempt several times and push the backoff out with it.
+    if (reconnect_pending_.exchange(true)) {
+        return;
+    }
+
     int attempts = reconnect_attempts_.load();
     if ((max_reconnect_attempts_ != -1) && (attempts >= max_reconnect_attempts_)) {
         LITEMQTT_LOG_TO(log_channel_, log_level::warn)
             << "[mqtt_helper] Max reconnect attempts reached (" << max_reconnect_attempts_
             << "), giving up; call rearm_reconnect() to try again";
         should_reconnect_.store(false);
+        reconnect_pending_.store(false);
         return;
     }
 
@@ -597,12 +627,13 @@ inline void mqtt_helper::do_reconnect() {
     std::weak_ptr<mqtt_helper> weak = shared_from_this();
     reconnect_timer_.expires_after(std::chrono::milliseconds(delay_ms));
     reconnect_timer_.async_wait([weak](const asio::error_code& ec) {
-        if (ec) {
-            return;  // cancelled by stop()
-        }
         auto self = weak.lock();
         if (!self) {
             return;
+        }
+        self->reconnect_pending_.store(false);
+        if (ec) {
+            return;  // cancelled by stop()/start()
         }
         if (self->should_reconnect_.load() && !self->user_stopped_.load()) {
             self->do_connect();
