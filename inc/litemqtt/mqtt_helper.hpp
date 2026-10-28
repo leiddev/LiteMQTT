@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -256,7 +257,9 @@ inline void mqtt_helper::stop() {
         // stop()/the destructor joins the thread and releases the client.
         running_.store(false);
         if (auto client = lock_client()) {
-            client->async_disconnect();
+            client->async_disconnect([this]() { io_.stop(); });
+        } else {
+            io_.stop();
         }
         work_.reset();
         return;
@@ -265,12 +268,33 @@ inline void mqtt_helper::stop() {
     const bool was_running = running_.exchange(false);
     if (was_running) {
         if (auto client = lock_client()) {
-            client->async_disconnect();
+            // Wait (bounded) for the DISCONNECT to be flushed and the socket to
+            // be closed.  The write completes on the io thread, so the wait has
+            // to happen before io_.stop().
+            std::mutex mutex;
+            std::condition_variable cv;
+            bool closed = false;
+            client->async_disconnect([&mutex, &cv, &closed]() {
+                std::lock_guard<std::mutex> lock(mutex);
+                closed = true;
+                cv.notify_all();
+            });
+            std::unique_lock<std::mutex> lock(mutex);
+            cv.wait_for(lock, std::chrono::seconds(2), [&closed]() { return closed; });
         }
         work_.reset();
+
+        // Force run() to return.  Releasing the work guard is not enough: the
+        // resolver service keeps a work unit on this io_context for as long as
+        // the connection (and with it the resolver) exists, so the io thread
+        // would stay blocked in epoll_wait and join() would never return.
+        io_.stop();
     }
 
     if (io_thread_.joinable()) {
+        // Also covers the case where running_ was already false (e.g. after a
+        // stop() from the io thread): run() must return for the join to finish.
+        io_.stop();
         io_thread_.join();
     }
 

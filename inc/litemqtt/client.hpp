@@ -39,7 +39,10 @@ public:
 
     void async_connect(const std::string& host, uint16_t port,
                         connect_cb callback = nullptr);
-    void async_disconnect();
+    /// Sends DISCONNECT (best effort) and closes the connection.  `on_closed`
+    /// runs on the io thread once the socket is closed; it is also invoked when
+    /// the write fails, so callers can use it to wait for the teardown.
+    void async_disconnect(std::function<void()> on_closed = nullptr);
 
     void async_publish(const std::string& topic, const std::string& payload,
                        uint8_t qos = 0, publish_cb callback = nullptr);
@@ -479,12 +482,16 @@ inline void mqtt_client::cancel_ping_timer() {
     ping_timer_->cancel(ec);
 }
 
-inline void mqtt_client::async_disconnect() {
+inline void mqtt_client::async_disconnect(std::function<void()> on_closed) {
     cancel_ping_timer();
     disconnect_packet pkt;
     auto self = shared_from_this();
-    conn_->async_write_packet(pkt.serialize(), [this, self](const asio::error_code&) {
+    conn_->async_write_packet(pkt.serialize(), [this, self, on_closed = std::move(on_closed)](
+                                                   const asio::error_code&) {
         conn_->close();
+        if (on_closed) {
+            on_closed();
+        }
     });
 }
 
