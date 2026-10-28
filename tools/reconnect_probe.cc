@@ -95,7 +95,14 @@ long probe_pid() {
 }
 
 std::shared_ptr<litemqtt::mqtt_helper> make_helper(port_slot slot, const char* client_id) {
-    return std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", probe_port(slot), client_id);
+    auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", probe_port(slot), client_id);
+    // Every scenario here talks to loopback, where a connect is sub-millisecond and a
+    // refusal is instant on Linux.  Windows can take a couple of seconds to surface the
+    // RST of a refused loopback connect (SYN retransmits), which would make the retry
+    // cadences below measure the OS instead of the reconnect policy; cap each attempt so
+    // even a port with no listener fails on our own terms.
+    helper->set_connect_timeout(150);
+    return helper;
 }
 
 /// Minimal broker: accepts a TCP connection, answers the CONNECT with a

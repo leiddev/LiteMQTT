@@ -34,6 +34,11 @@ bool wait_for(const std::function<bool()>& pred, int timeout_ms) {
 std::shared_ptr<litemqtt::mqtt_helper> make_helper(const std::string& id) {
     auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", kRefusedPort, id);
     helper->set_log_handler([](const litemqtt::log_record&) {});
+    // A refused connect on loopback is instant on Linux but can take a couple of
+    // seconds on Windows (SYN retransmits before the RST surfaces), which would put
+    // every retry cadence below on the OS instead of on the reconnect logic.  Cap the
+    // attempt so the timing assertions stay about the helper.
+    helper->set_connect_timeout(150);
     return helper;
 }
 
