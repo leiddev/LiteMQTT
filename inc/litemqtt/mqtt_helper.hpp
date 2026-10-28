@@ -76,6 +76,10 @@ private:
     void init_client();
     void start_io_thread();
     void release_client();
+    /// Returns a snapshot of client_; callers must not hold the lock while
+    /// invoking into it (that keeps the critical section tiny and avoids
+    /// re-entering user code under a lock).
+    std::shared_ptr<mqtt_client> lock_client() const;
     void do_connect();
     void do_reconnect();
     void setup_callbacks();
@@ -99,7 +103,10 @@ private:
 
     asio::io_context io_;
     std::unique_ptr<asio::io_context::work> work_;
+    /// Mutex-protected because start()/stop() may replace it while
+    /// is_connected()/publish()/subscribe() run on another thread.
     std::shared_ptr<mqtt_client> client_;
+    mutable std::mutex client_mutex_;
     std::thread io_thread_;
     asio::steady_timer reconnect_timer_;  ///< Backoff timer, never blocks the io thread
 
@@ -153,8 +160,9 @@ inline void mqtt_helper::set_log_handler(log_handler handler) {
     // so that transport level records (connect failures, protocol errors, ...)
     // are routed to the same backend.
     log_channel_.set_handler(handler);
-    if (client_) {
-        client_->set_log_handler(std::move(handler));
+    auto client = lock_client();
+    if (client) {
+        client->set_log_handler(std::move(handler));
     }
 }
 
@@ -175,11 +183,15 @@ inline void mqtt_helper::subscribe(
         subscribes_.emplace_back(topic, qos);
     }
 
-    if (!client_ || !is_connected()) {
+    if (!is_connected()) {
         return;
     }
 
-    client_->async_subscribe(topic, qos, std::move(callback));
+    auto client = lock_client();
+    if (!client) {
+        return;
+    }
+    client->async_subscribe(topic, qos, std::move(callback));
 }
 
 inline void mqtt_helper::publish(const std::string& topic,
@@ -191,9 +203,12 @@ inline void mqtt_helper::publish(
     const std::string& topic, const std::string& payload, uint8_t qos,
     std::function<void(bool success, std::string topic, uint8_t qos,
                        uint16_t packet_id)> callback) {
-    if (!client_) return;
+    auto client = lock_client();
+    if (!client) {
+        return;
+    }
 
-    client_->async_publish(topic, payload, qos, std::move(callback));
+    client->async_publish(topic, payload, qos, std::move(callback));
 }
 
 inline void mqtt_helper::start() {
@@ -240,8 +255,8 @@ inline void mqtt_helper::stop() {
         // "Resource deadlock avoided", so only stop the loop here; the next
         // stop()/the destructor joins the thread and releases the client.
         running_.store(false);
-        if (client_) {
-            client_->async_disconnect();
+        if (auto client = lock_client()) {
+            client->async_disconnect();
         }
         work_.reset();
         return;
@@ -249,8 +264,8 @@ inline void mqtt_helper::stop() {
 
     const bool was_running = running_.exchange(false);
     if (was_running) {
-        if (client_) {
-            client_->async_disconnect();
+        if (auto client = lock_client()) {
+            client->async_disconnect();
         }
         work_.reset();
     }
@@ -266,7 +281,13 @@ inline void mqtt_helper::stop() {
 }
 
 inline bool mqtt_helper::is_connected() const {
-    return client_ && client_->state() == connection_state::connected;
+    auto client = lock_client();
+    return client && client->state() == connection_state::connected;
+}
+
+inline std::shared_ptr<mqtt_client> mqtt_helper::lock_client() const {
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    return client_;
 }
 
 inline bool mqtt_helper::is_running() const {
@@ -290,6 +311,9 @@ inline void mqtt_helper::init_client() {
         if (log_channel_.has_handler()) {
             client->set_log_handler(log_channel_.handler());
         }
+    }
+    {
+        std::lock_guard<std::mutex> lock(client_mutex_);
         client_ = std::move(client);
     }
 }
@@ -312,17 +336,21 @@ inline void mqtt_helper::start_io_thread() {
 }
 
 inline void mqtt_helper::release_client() {
-    if (!client_) {
+    std::shared_ptr<mqtt_client> client;
+    {
+        std::lock_guard<std::mutex> lock(client_mutex_);
+        client.swap(client_);
+    }
+    if (!client) {
         return;
     }
 
     // The client holds std::function objects that capture this helper.  Clear
     // them before dropping the client, otherwise the two keep each other alive
     // and ~mqtt_helper() (the only automatic stop()) never runs.
-    client_->on_message(nullptr);
-    client_->on_close(nullptr);
-    client_->on_connect(nullptr);
-    client_.reset();
+    client->on_message(nullptr);
+    client->on_close(nullptr);
+    client->on_connect(nullptr);
 }
 
 inline void mqtt_helper::setup_callbacks() {
@@ -332,21 +360,32 @@ inline void mqtt_helper::setup_callbacks() {
     // be destroyed: the io_context, the socket and the io thread would leak and
     // ~mqtt_helper() would never stop them.
     std::weak_ptr<mqtt_helper> weak = shared_from_this();
+    auto client = lock_client();
+    if (!client) {
+        return;
+    }
 
-    client_->on_message([weak](std::string topic, std::string payload,
+    client->on_message([weak](std::string topic, std::string payload,
                                 uint8_t qos, uint16_t packet_id) {
         auto self = weak.lock();
         if (!self) {
             return;
         }
-        std::lock_guard<std::mutex> lock(self->callback_mutex_);
-        if (self->message_callback_) {
-            self->message_callback_(std::move(topic), std::move(payload),
-                                      qos, packet_id);
+        // Copy the callback under the lock, then invoke it without: the handler
+        // runs on the io thread and may legitimately call helper methods
+        // (on_message() included), which would deadlock on a non-recursive
+        // mutex.
+        message_callback callback;
+        {
+            std::lock_guard<std::mutex> lock(self->callback_mutex_);
+            callback = self->message_callback_;
+        }
+        if (callback) {
+            callback(std::move(topic), std::move(payload), qos, packet_id);
         }
     });
 
-    client_->on_close([weak]() {
+    client->on_close([weak]() {
         auto self = weak.lock();
         if (!self) {
             return;
@@ -358,7 +397,7 @@ inline void mqtt_helper::setup_callbacks() {
         }
     });
 
-    client_->on_connect([weak](bool success, uint8_t rc) {
+    client->on_connect([weak](bool success, uint8_t rc) {
         auto self = weak.lock();
         if (!self) {
             return;
@@ -383,17 +422,18 @@ inline void mqtt_helper::setup_callbacks() {
         self->initial_connect_.store(false);
 
         // Restore subscriptions
-        {
+        if (auto client = self->lock_client()) {
             std::lock_guard<std::mutex> lock(self->pending_mutex_);
             for (auto& item : self->subscribes_) {
-                self->client_->async_subscribe(item.first, item.second, nullptr);
+                client->async_subscribe(item.first, item.second, nullptr);
             }
         }
     });
 }
 
 inline void mqtt_helper::do_connect() {
-    if (!client_) {
+    auto client = lock_client();
+    if (!client) {
         LITEMQTT_LOG_TO(log_channel_, log_level::error) << "[mqtt_helper] client_ is null!";
         return;
     }
@@ -401,7 +441,7 @@ inline void mqtt_helper::do_connect() {
     LITEMQTT_LOG_TO(log_channel_, log_level::info)
         << "[mqtt_helper] Initiating connection to " << host_ << ":" << port_ << "...";
 
-    client_->async_connect(host_, port_);
+    client->async_connect(host_, port_);
 }
 
 inline void mqtt_helper::do_reconnect() {
