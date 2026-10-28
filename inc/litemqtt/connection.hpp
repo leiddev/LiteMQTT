@@ -2,6 +2,7 @@
 #define LITEMQTT_CONNECTION_HPP
 
 #include <array>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -36,7 +37,14 @@ public:
 
     void async_connect(const std::string& host, uint16_t port, connect_handler handler);
     void async_read_packet(read_handler handler);
-    void async_write_packet(const std::vector<uint8_t>& data, write_handler handler);
+
+    /// Queues one frame for writing.  The buffer is taken by value and owned by
+    /// the queue until the write completes, so callers may pass a temporary
+    /// (e.g. `pkt.serialize()`) and need not keep it alive.  Frames are written
+    /// strictly one after another: overlapping asio::async_write() calls on the
+    /// same socket are not allowed and would corrupt the byte stream.
+    void async_write_packet(std::vector<uint8_t> data, write_handler handler);
+
     void mark_connected();
     void close();
 
@@ -53,6 +61,15 @@ private:
     void read_remaining_length(read_handler handler, uint8_t first_byte);
     void read_packet_body(read_handler handler, std::size_t remaining_length);
 
+    struct write_item {
+        std::vector<uint8_t> buffer;
+        write_handler handler;
+    };
+
+    void enqueue_write(std::vector<uint8_t> data, write_handler handler);
+    void do_write();
+    void fail_pending_writes(const asio::error_code& ec);
+
     asio::io_context& io_;
     asio::ip::tcp::socket socket_;
     asio::ip::tcp::resolver resolver_;
@@ -62,6 +79,11 @@ private:
     int reading_depth_ = 0;
 
     close_handler close_handler_;
+
+    // Write queue: only touched from the io thread (async_write_packet() posts
+    // the enqueue), which keeps it lock free.
+    std::deque<write_item> write_queue_;
+    bool writing_ = false;
 };
 
 inline connection::connection(asio::io_context& io)
@@ -204,13 +226,70 @@ inline void connection::read_packet_body(read_handler handler, std::size_t remai
         });
 }
 
-inline void connection::async_write_packet(const std::vector<uint8_t>& data, write_handler handler) {
+inline void connection::async_write_packet(std::vector<uint8_t> data, write_handler handler) {
+    // Hop to the io thread first: callers include user threads (e.g. a
+    // disconnect issued from another thread), while the queue below must only
+    // ever be touched from one thread.  Posting also preserves the call order,
+    // so frames reach the wire in the order they were queued.
+    auto self = shared_from_this();
+    io_.post([self, data = std::move(data), handler = std::move(handler)]() mutable {
+        self->enqueue_write(std::move(data), std::move(handler));
+    });
+}
+
+inline void connection::enqueue_write(std::vector<uint8_t> data, write_handler handler) {
+    write_queue_.push_back(write_item{std::move(data), std::move(handler)});
+    if (!writing_) {
+        do_write();
+    }
+}
+
+inline void connection::do_write() {
+    if (write_queue_.empty()) {
+        writing_ = false;
+        return;
+    }
+
+    if (!socket_.is_open()) {
+        // The socket is gone: fail whatever is still queued (asynchronously, so
+        // that callers never observe a callback from inside async_write_packet).
+        auto self = shared_from_this();
+        io_.post([self]() { self->fail_pending_writes(asio::error::bad_descriptor); });
+        return;
+    }
+
+    writing_ = true;
     auto self = shared_from_this();
     asio::async_write(socket_,
-        asio::buffer(data.data(), data.size()),
-        [this, self, handler](const asio::error_code& ec, std::size_t /*bytes*/) {
-            handler(ec);
+        asio::buffer(write_queue_.front().buffer),
+        [this, self](const asio::error_code& ec, std::size_t /*bytes*/) {
+            // The buffer being written lives in the queue and is only released
+            // here, once asio is done with it -- this is what makes passing a
+            // temporary serialized packet safe.
+            write_item item = std::move(write_queue_.front());
+            write_queue_.pop_front();
+            writing_ = false;
+
+            if (item.handler) {
+                item.handler(ec);
+            }
+
+            if (!writing_ && !write_queue_.empty()) {
+                do_write();
+            }
         });
+}
+
+inline void connection::fail_pending_writes(const asio::error_code& ec) {
+    std::deque<write_item> pending;
+    pending.swap(write_queue_);
+    writing_ = false;
+
+    for (auto& item : pending) {
+        if (item.handler) {
+            item.handler(ec);
+        }
+    }
 }
 
 inline void connection::mark_connected() {
