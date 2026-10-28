@@ -75,7 +75,7 @@ public:
 private:
     void init_client();
     void start_io_thread();
-    void stop_io_thread();
+    void release_client();
     void do_connect();
     void do_reconnect();
     void setup_callbacks();
@@ -210,19 +210,25 @@ inline void mqtt_helper::start() {
 }
 
 inline void mqtt_helper::stop() {
-    if (!running_.load()) {
-        return;
-    }
-
     user_stopped_.store(true);
     should_reconnect_.store(false);
 
-    if (client_) {
-        client_->async_disconnect();
+    const bool was_running = running_.exchange(false);
+    if (was_running) {
+        if (client_) {
+            client_->async_disconnect();
+        }
+        work_.reset();
     }
 
-    work_.reset();
-    stop_io_thread();
+    if (io_thread_.joinable()) {
+        io_thread_.join();
+    }
+
+    // Runs even when stop() is entered with running_ == false (never started, or
+    // already stopped) so that a helper that was only partially started does not
+    // keep its client -- and through it this helper -- alive.
+    release_client();
 }
 
 inline bool mqtt_helper::is_connected() const {
@@ -271,18 +277,34 @@ inline void mqtt_helper::start_io_thread() {
     });
 }
 
-inline void mqtt_helper::stop_io_thread() {
-    if (io_thread_.joinable()) {
-        io_thread_.join();
+inline void mqtt_helper::release_client() {
+    if (!client_) {
+        return;
     }
-    running_.store(false);
+
+    // The client holds std::function objects that capture this helper.  Clear
+    // them before dropping the client, otherwise the two keep each other alive
+    // and ~mqtt_helper() (the only automatic stop()) never runs.
+    client_->on_message(nullptr);
+    client_->on_close(nullptr);
+    client_->on_connect(nullptr);
+    client_.reset();
 }
 
 inline void mqtt_helper::setup_callbacks() {
-    auto self = shared_from_this();
+    // Captured weakly on purpose: this helper owns client_, so a shared_ptr to
+    // the helper stored inside the client's callbacks would create the cycle
+    // helper -> client -> callback -> helper.  Neither object would then ever
+    // be destroyed: the io_context, the socket and the io thread would leak and
+    // ~mqtt_helper() would never stop them.
+    std::weak_ptr<mqtt_helper> weak = shared_from_this();
 
-    client_->on_message([self](std::string topic, std::string payload,
+    client_->on_message([weak](std::string topic, std::string payload,
                                 uint8_t qos, uint16_t packet_id) {
+        auto self = weak.lock();
+        if (!self) {
+            return;
+        }
         std::lock_guard<std::mutex> lock(self->callback_mutex_);
         if (self->message_callback_) {
             self->message_callback_(std::move(topic), std::move(payload),
@@ -290,7 +312,11 @@ inline void mqtt_helper::setup_callbacks() {
         }
     });
 
-    client_->on_close([self]() {
+    client_->on_close([weak]() {
+        auto self = weak.lock();
+        if (!self) {
+            return;
+        }
         LITEMQTT_LOG_TO(self->log_channel_, log_level::info)
             << "[mqtt_helper] Connection closed";
         if (self->should_reconnect_.load() && !self->user_stopped_.load()) {
@@ -298,7 +324,11 @@ inline void mqtt_helper::setup_callbacks() {
         }
     });
 
-    client_->on_connect([self](bool success, uint8_t rc) {
+    client_->on_connect([weak](bool success, uint8_t rc) {
+        auto self = weak.lock();
+        if (!self) {
+            return;
+        }
         LITEMQTT_LOG_TO(self->log_channel_, log_level::debug)
             << "[mqtt_helper] Connection callback fired: success=" << success
             << ", rc=" << static_cast<int>(rc);
