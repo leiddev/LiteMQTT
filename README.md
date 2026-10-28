@@ -54,7 +54,8 @@ LiteMQTT/
 │   ├── helper_test.cc      # Lifetime, stop()/start(), backoff
 │   └── log_test.cc
 └── tools/
-    └── reconnect_probe.cc  # Reconnect / leak probe suite
+    ├── reconnect_probe.cc   # Reconnect / leak probe suite
+    └── reconnect_stress.cc  # Publish-while-reconnecting stress harness
 ```
 
 ## Build
@@ -70,6 +71,7 @@ The build produces:
 
 - `LiteMQTTDemo` – the demo client (`main.cc`)
 - `reconnect_probe` – reconnect / leak probe suite (`tools/`)
+- `reconnect_stress` – publish-while-reconnecting stress harness (`tools/`)
 - `codec_test`, `client_test`, `connection_test`, `helper_test`, `log_test` – unit tests
   (if GoogleTest is available)
 
@@ -129,6 +131,45 @@ the numbers that decide pass/fail.
 Scenarios listen on `127.0.0.1` at `18840 + slot`; export
 `LITEMQTT_PROBE_PORT_BASE` to move the whole block. Exit code `0` means the
 observed behaviour matched expectations.
+
+## Reconnect Stress Harness
+
+`reconnect_stress` answers a different question than the probes: *does anything
+leak while the client keeps publishing through a link that is down, flapping or
+half-dead?* It starts a chaos broker on loopback, drives the link through a
+scripted schedule and publishes QoS 1 messages at a fixed rate the whole time.
+
+```bash
+./reconnect_stress --help                 # list scenarios and options
+./reconnect_stress --scenario flap     --duration 30
+./reconnect_stress --scenario weak     --duration 120 --rate 200
+./reconnect_stress --scenario soak     --duration 300
+./reconnect_stress --scenario mixed    --duration 120
+```
+
+| Scenario    | Link behaviour                                                        |
+|-------------|-----------------------------------------------------------------------|
+| `flap`      | The broker drops every session after ~80 ms, forever.                  |
+| `long`      | One long outage, then recovery.                                       |
+| `blackhole` | The listener accepts and then goes silent (no CONNACK, no reads).      |
+| `weak`      | Slow reads plus short outages — a weak link, not a dead one.           |
+| `mixed`     | All of the above in one schedule.                                      |
+| `soak`      | A long, slow churn for endurance runs.                                 |
+
+Every publish must be answered exactly once, and the summary checks that the
+broker saw no framing or ordering errors, that the link really did break and
+come back, that `stop()` returns immediately and that descriptors, threads and
+RSS did not grow. The three resource counters are read from `/proc`, so they
+are only meaningful on Linux (elsewhere those checks pass trivially). Run it
+under AddressSanitizer for a leak check that goes beyond those counters (RSS is
+meaningless there, so relax it):
+
+```bash
+g++ -std=c++14 -g -O1 -fsanitize=address -I inc -I 3rdparty/asio/include \
+    -pthread tools/reconnect_stress.cc -o reconnect_stress_asan
+ASAN_OPTIONS=detect_leaks=1 ./reconnect_stress_asan --scenario mixed \
+    --duration 30 --rss-limit-mb 4096
+```
 
 ## Usage Example
 
@@ -210,6 +251,22 @@ int main() {
 After giving up, `is_reconnect_armed()` returns `false` and `rearm_reconnect()`
 puts the helper back to work (returns `false` if it is not running, in which case
 `start()` is what you need). Both are safe to call from any thread.
+
+Every attempt is bounded by a connect timeout that covers TCP connect *and* the
+CONNACK wait, so a blackholed peer cannot stall the session forever:
+
+```cpp
+helper->set_connect_timeout(10000);  // ms, default 10000; 0 disables the timeout
+```
+
+A timed-out attempt is treated like any other failure: `on_connect(false, 255)`
+fires, the socket is closed and the reconnect policy decides what happens next.
+
+While a session is not connected, `publish()` does not queue and does not touch
+the socket — it reports `callback(false, topic, qos, 0)` immediately. That keeps
+a publish from a timer from tearing down a connect attempt that is in progress;
+re-publish from your `on_connect(true)` handler (or retry on the failure
+callback) once the link is back.
 
 ## Logging
 

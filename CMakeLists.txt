@@ -34,6 +34,16 @@ target_include_directories(reconnect_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/i
 target_link_libraries(reconnect_probe asio)
 target_compile_definitions(reconnect_probe PRIVATE ASIO_STANDALONE _WIN32_WINNT=0x0601)
 
+# Reconnect stress harness: manual tool (chaos broker on a loopback port, keeps
+# publishing while the link flaps / blackholes / disappears), not part of ctest.
+add_executable(reconnect_stress tools/reconnect_stress.cc)
+target_include_directories(reconnect_stress PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/inc)
+target_link_libraries(reconnect_stress asio)
+target_compile_definitions(reconnect_stress PRIVATE ASIO_STANDALONE _WIN32_WINNT=0x0601)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND UNIX)
+    target_link_libraries(reconnect_stress pthread)
+endif()
+
 # Unit tests
 enable_testing()
 find_package(GTest QUIET)
