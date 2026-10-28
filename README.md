@@ -268,6 +268,48 @@ a publish from a timer from tearing down a connect attempt that is in progress;
 re-publish from your `on_connect(true)` handler (or retry on the failure
 callback) once the link is back.
 
+## Delivery Guarantees
+
+The publish window lives in memory only — nothing is persisted — and the
+callback contract is deliberately narrow. It is the same for `mqtt_client` and
+`mqtt_helper`:
+
+| QoS | `callback(true, ...)` means                                  | Retry inside the session |
+|-----|--------------------------------------------------------------|--------------------------|
+| 0   | the PUBLISH frame was handed to the socket                    | none (fire and forget)   |
+| 1   | the broker's PUBACK for this packet id arrived                | 5 s, up to 3 attempts, `DUP = 1` on retries |
+| 2   | the broker's PUBCOMP arrived (PUBLISH → PUBREC → PUBREL → PUBCOMP) | 5 s / 3 attempts for PUBLISH → PUBREC as above; 5 s / 3 attempts for PUBREL → PUBCOMP |
+
+Three rules follow from that, and they are intentional:
+
+- **A disconnect fails everything still in flight.** `notify_closed_once()`
+  reports `callback(false, topic, qos, packet_id)` for every unacknowledged
+  publish (and every un-SUBACKed subscribe) and drops it. Nothing is re-sent
+  after the next `on_connect(true)`.
+- **QoS 1 retries at most three times, then gives up.** No PUBACK within 5 s
+  re-sends the frame with `DUP = 1`; after the third attempt the publish is
+  reported as failed even though the broker may in fact have received it.
+  A QoS 2 message that never gets its PUBCOMP aborts the session instead
+  (which, under `mqtt_helper`, means `on_connect(false, 255)` and a reconnect).
+- **There is no offline queue.** Publishing while the session is down
+  (connecting, waiting for CONNACK, or between reconnects) reports
+  `callback(false, topic, qos, 0)` immediately — it is never buffered, and it
+  does not disturb the connect attempt in progress. The in-flight window is
+  bounded at 1000 publishes (`kMaxPendingPublishes`); when it is full the new
+  publish is rejected with `false` and a warning is logged.
+
+Republishing is the application's responsibility: re-send from
+`on_connect(true)` whatever was in flight, or retry from the failure callback.
+Keep that path idempotent — a `DUP = 1` frame the broker did receive can still
+be delivered twice. Subscriptions are per session as well, so re-issue them
+after a reconnect; `mqtt_helper` does that for you for everything registered
+before `start()`.
+
+If you need at-least-once across reconnects, keep the queue *above* the
+library. `tools/reconnect_stress.cc` is a worked example of the bookkeeping:
+it counts every publish and fails the run if one is never reported back (and
+if any is reported twice).
+
 ## Logging
 
 The library never writes to `std::cout` / `std::cerr` directly any more: every
