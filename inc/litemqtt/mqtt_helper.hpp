@@ -207,6 +207,15 @@ inline void mqtt_helper::start() {
     // previous run would otherwise make do_reconnect() give up immediately.
     reconnect_attempts_.store(0);
     initial_connect_.store(true);
+
+    // asio marks the io_context as stopped once run() has returned (which it
+    // does as soon as the work guard is gone).  Without this restart the second
+    // start()'s io thread would return immediately, so nothing would ever be
+    // connected again.
+    if (io_.stopped()) {
+        io_.restart();
+    }
+
     work_ = std::make_unique<asio::io_context::work>(io_);
 
     init_client();
