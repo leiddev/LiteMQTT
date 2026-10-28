@@ -297,6 +297,14 @@ inline void mqtt_client::handle_connack(const std::vector<uint8_t>& data) {
     if (pkt.return_code == 0) {
         conn_->mark_connected();
         closed_ = false;
+    } else {
+        // The broker refused the session (bad credentials, not authorized, ...).
+        // Close the socket right away instead of leaving it to the next connect
+        // attempt: the broker would keep a zombie session open for the whole
+        // backoff window otherwise.  closed_ suppresses the close notification,
+        // the reconnect is driven from the on_connect(false) callback below.
+        closed_ = true;
+        conn_->close();
     }
     if (on_connect_cb_) on_connect_cb_(pkt.return_code == 0, pkt.return_code);
 }
