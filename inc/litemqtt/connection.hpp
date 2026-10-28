@@ -2,6 +2,7 @@
 #define LITEMQTT_CONNECTION_HPP
 
 #include <array>
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -53,12 +54,24 @@ public:
     }
 
     connection_state state() const {
-        return state_;
+        return state_.load();
     }
 
 private:
     void read_fixed_header(read_handler handler);
     void read_remaining_length(read_handler handler, uint8_t first_byte);
+
+    // Kept alive by the async handlers of read_remaining_length_step() so that a
+    // multi-byte length can be assembled across several async_read calls.
+    struct remaining_length_state {
+        std::array<uint8_t, 4> byte_buffer{};
+        std::size_t bytes_read = 0;
+        std::size_t multiplier = 1;
+        std::size_t remaining_length = 0;
+    };
+    void read_remaining_length_step(read_handler handler,
+                                    std::shared_ptr<remaining_length_state> st);
+
     void read_packet_body(read_handler handler, std::size_t remaining_length);
 
     struct write_item {
@@ -73,9 +86,15 @@ private:
     asio::io_context& io_;
     asio::ip::tcp::socket socket_;
     asio::ip::tcp::resolver resolver_;
-    connection_state state_ = connection_state::disconnected;
+    // Written on the io thread, read from user threads (is_connected()).
+    std::atomic<connection_state> state_{connection_state::disconnected};
 
     std::array<uint8_t, 2> fixed_header_{};
+    // Raw fixed header of the packet being read: type byte plus *all* remaining
+    // length bytes.  Packets are handed to the parser with their fixed header,
+    // so every length byte has to be kept -- dropping the continuation bytes
+    // makes the parser re-read the body as a length field.
+    std::vector<uint8_t> read_header_;
     int reading_depth_ = 0;
 
     close_handler close_handler_;
@@ -105,6 +124,8 @@ inline void connection::async_connect(const std::string& host, uint16_t port, co
                 [this, self, handler](const asio::error_code& ec, const asio::ip::tcp::endpoint&) {
                     if (!ec) {
                         state_ = connection_state::handshaking;
+                    } else {
+                        state_ = connection_state::disconnected;
                     }
                     handler(ec);
                 });
@@ -136,68 +157,71 @@ inline void connection::read_fixed_header(read_handler handler) {
                 return;
             }
 
+            read_header_.clear();
+            read_header_.push_back(fixed_header_[0]);
+            read_header_.push_back(fixed_header_[1]);
+
             read_remaining_length(handler, fixed_header_[1]);
         });
 }
 
 inline void connection::read_remaining_length(read_handler handler, uint8_t first_byte) {
-    auto self = shared_from_this();
-
-    struct state {
-        std::array<uint8_t, 4> byte_buffer{};
-        std::size_t bytes_read = 0;
-        std::size_t multiplier = 1;
-        std::size_t remaining_length = 0;
-    };
-    auto st = std::make_shared<state>();
+    auto st = std::make_shared<remaining_length_state>();
     st->byte_buffer[0] = first_byte;
     st->bytes_read = 1;
     st->remaining_length = (first_byte & 0x7F) * st->multiplier;
     st->multiplier = 128;
 
-    std::function<void()> do_read;
-    do_read = [this, self, st, handler, &do_read]() {
-        asio::async_read(socket_,
-            asio::buffer(st->byte_buffer.data() + st->bytes_read, 1),
-            [this, self, st, handler, &do_read](const asio::error_code& ec, std::size_t) {
-                if (ec) {
-                    reading_depth_ = 0;
-                    io_.post([handler, ec]() { handler(ec, {}); });
-                    return;
-                }
-
-                uint8_t b = st->byte_buffer[st->bytes_read];
-                ++st->bytes_read;
-                st->remaining_length += (b & 0x7F) * st->multiplier;
-                st->multiplier *= 128;
-
-                if (st->bytes_read > 4) {
-                    reading_depth_ = 0;
-                    io_.post([handler]() { handler(asio::error::make_error_code(asio::error::message_size), {}); });
-                    return;
-                }
-
-                if ((b & 0x80) != 0) {
-                    do_read();
-                } else {
-                    read_packet_body(handler, st->remaining_length);
-                }
-            });
-    };
-
     if ((first_byte & 0x80) != 0) {
-        do_read();
+        read_remaining_length_step(handler, st);
     } else {
         read_packet_body(handler, st->remaining_length);
     }
 }
 
+inline void connection::read_remaining_length_step(read_handler handler,
+                                                   std::shared_ptr<remaining_length_state> st) {
+    // This used to be a local std::function captured by reference: it dangled as
+    // soon as read_remaining_length() returned, so the continuation invoked a
+    // destroyed std::function for any packet whose length needs 3+ bytes.
+    // Passing the shared state down the (non-growing) recursion keeps it alive
+    // for exactly as long as the async operation needs it.
+    auto self = shared_from_this();
+    asio::async_read(socket_,
+        asio::buffer(st->byte_buffer.data() + st->bytes_read, 1),
+        [this, self, st, handler](const asio::error_code& ec, std::size_t) {
+            if (ec) {
+                reading_depth_ = 0;
+                io_.post([handler, ec]() { handler(ec, {}); });
+                return;
+            }
+
+            const uint8_t b = st->byte_buffer[st->bytes_read];
+            ++st->bytes_read;
+            st->remaining_length += (b & 0x7F) * st->multiplier;
+            st->multiplier *= 128;
+
+            if (st->bytes_read > 4) {
+                reading_depth_ = 0;
+                io_.post([handler]() { handler(asio::error::make_error_code(asio::error::message_size), {}); });
+                return;
+            }
+
+            // Keep this length byte: the parser re-reads the fixed header, so the
+            // packet handed over must contain all of it.
+            read_header_.push_back(b);
+
+            if ((b & 0x80) != 0) {
+                read_remaining_length_step(handler, st);
+            } else {
+                read_packet_body(handler, st->remaining_length);
+            }
+        });
+}
+
 inline void connection::read_packet_body(read_handler handler, std::size_t remaining_length) {
     if (remaining_length == 0) {
-        std::vector<uint8_t> packet;
-        packet.reserve(2);
-        packet.push_back(fixed_header_[0]);
-        packet.push_back(fixed_header_[1]);
+        std::vector<uint8_t> packet(read_header_);
         reading_depth_ = 0;
         io_.post([handler, packet]() { handler(asio::error_code(), packet); });
         return;
@@ -205,10 +229,11 @@ inline void connection::read_packet_body(read_handler handler, std::size_t remai
 
     auto self = shared_from_this();
     auto body_buf = std::make_shared<std::vector<uint8_t>>(remaining_length);
+    const std::vector<uint8_t> header = read_header_;
 
     asio::async_read(socket_,
         asio::buffer(body_buf->data(), remaining_length),
-        [this, self, handler, body_buf](const asio::error_code& ec, std::size_t) {
+        [this, self, handler, body_buf, header](const asio::error_code& ec, std::size_t) {
             if (ec) {
                 reading_depth_ = 0;
                 io_.post([handler, ec]() { handler(ec, {}); });
@@ -216,9 +241,8 @@ inline void connection::read_packet_body(read_handler handler, std::size_t remai
             }
 
             std::vector<uint8_t> packet;
-            packet.reserve(2 + body_buf->size());
-            packet.push_back(fixed_header_[0]);
-            packet.push_back(fixed_header_[1]);
+            packet.reserve(header.size() + body_buf->size());
+            packet.insert(packet.end(), header.begin(), header.end());
             packet.insert(packet.end(), body_buf->begin(), body_buf->end());
 
             reading_depth_ = 0;
