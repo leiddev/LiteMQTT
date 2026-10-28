@@ -43,6 +43,12 @@ public:
     /// runs on the io thread once the socket is closed; it is also invoked when
     /// the write fails, so callers can use it to wait for the teardown.
     void async_disconnect(std::function<void()> on_closed = nullptr);
+    /// Drops the session right away, without sending DISCONNECT: the socket is
+    /// closed and every pending write callback is failed with
+    /// operation_aborted.  Meant for shutdown paths where the graceful
+    /// async_disconnect() did not finish in time.  Call it once the io thread is
+    /// no longer running, or from the io thread itself.
+    void close();
 
     void async_publish(const std::string& topic, const std::string& payload,
                        uint8_t qos = 0, publish_cb callback = nullptr);
@@ -237,10 +243,15 @@ inline void mqtt_client::send_connect_packet() {
 
     auto self = shared_from_this();
     conn_->async_write_packet(pkt.serialize(), [this, self](const asio::error_code& ec) {
-        if (!ec) {
-            schedule_pingreq();
-            start_read_loop();
+        if (ec) {
+            // The broker accepted the socket and dropped it, or the stream broke:
+            // without this the session would sit there waiting for a CONNACK that
+            // can never arrive.
+            notify_closed_once();
+            return;
         }
+        schedule_pingreq();
+        start_read_loop();
     });
 }
 
@@ -493,6 +504,13 @@ inline void mqtt_client::async_disconnect(std::function<void()> on_closed) {
             on_closed();
         }
     });
+}
+
+inline void mqtt_client::close() {
+    // conn_->close() invokes the close handler, which in turn calls
+    // notify_closed_once(): the session is marked closed, the ping timer stops
+    // and the pending publishes are failed.
+    conn_->close();
 }
 
 inline void mqtt_client::async_publish(const std::string& topic, const std::string& payload,

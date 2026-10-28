@@ -135,6 +135,20 @@ TEST(MqttHelperLifetime, StopFromIoThreadDoesNotThrow) {
     helper->stop();  // finish the teardown from this thread
 }
 
+// A session that never got connected has nothing to flush, so stop() must not sit
+// in the graceful-shutdown timeout waiting for a DISCONNECT that cannot be sent.
+TEST(MqttHelperLifetime, StopAfterAFailedConnectReturnsQuickly) {
+    auto helper = make_helper("failed-connect");
+    helper->set_reconnect_config(0, 10);
+    helper->start();
+    ASSERT_TRUE(wait_for([&helper]() { return !helper->is_reconnect_armed(); }, 2000));
+
+    const auto begin = steady_clock::now();
+    helper->stop();
+    const auto elapsed = duration_cast<milliseconds>(steady_clock::now() - begin).count();
+    EXPECT_LT(elapsed, 1000) << "stop() waited " << elapsed << " ms for an unsendable DISCONNECT";
+}
+
 // Once the attempt limit was hit nothing retries any more; rearm_reconnect()
 // must resume from a clean counter, without stop() + start().
 TEST(MqttHelperReconnect, RearmRetriesAfterGivingUp) {

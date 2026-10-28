@@ -102,7 +102,14 @@ private:
     // Write queue: only touched from the io thread (async_write_packet() posts
     // the enqueue), which keeps it lock free.
     std::deque<write_item> write_queue_;
+    // The item currently being written.  It is taken out of write_queue_ so that
+    // close() can fail everything that is still waiting without disturbing the
+    // buffer asio is using right now.
+    std::unique_ptr<write_item> in_flight_;
     bool writing_ = false;
+    // Set by close(); makes close() idempotent and keeps enqueue_write() from
+    // parking handlers on a dead connection.
+    bool closed_ = false;
 };
 
 inline connection::connection(asio::io_context& io)
@@ -111,6 +118,7 @@ inline connection::connection(asio::io_context& io)
 
 inline void connection::async_connect(const std::string& host, uint16_t port, connect_handler handler) {
     state_ = connection_state::connecting;
+    closed_ = false;  // the object may be reused for a new attempt
 
     auto self = shared_from_this();
     resolver_.async_resolve(host, std::to_string(port),
@@ -262,6 +270,20 @@ inline void connection::async_write_packet(std::vector<uint8_t> data, write_hand
 }
 
 inline void connection::enqueue_write(std::vector<uint8_t> data, write_handler handler) {
+    if (closed_) {
+        // Never park work on a dead connection: a queued handler keeps whatever it
+        // captured alive (mqtt_client holds this connection), so an item that can
+        // never run forms a cycle nothing else can break.  Report the failure
+        // asynchronously instead, so callers never see a callback from inside
+        // async_write_packet().
+        auto self = shared_from_this();
+        io_.post([self, handler = std::move(handler)]() {
+            if (handler) {
+                handler(asio::error::operation_aborted);
+            }
+        });
+        return;
+    }
     write_queue_.push_back(write_item{std::move(data), std::move(handler)});
     if (!writing_) {
         do_write();
@@ -269,36 +291,55 @@ inline void connection::enqueue_write(std::vector<uint8_t> data, write_handler h
 }
 
 inline void connection::do_write() {
+    if (writing_) {
+        return;
+    }
     if (write_queue_.empty()) {
-        writing_ = false;
         return;
     }
 
-    if (!socket_.is_open()) {
-        // The socket is gone: fail whatever is still queued (asynchronously, so
-        // that callers never observe a callback from inside async_write_packet).
+    // Only a handshaking or established socket can make progress.  An open but
+    // never connected socket never becomes writable (epoll never reports it), so
+    // starting a write on it would leave the item -- and everything its handler
+    // keeps alive -- stuck forever.  Fail those writes instead.
+    if (!socket_.is_open() || state_ == connection_state::disconnected ||
+        state_ == connection_state::connecting) {
         auto self = shared_from_this();
         io_.post([self]() { self->fail_pending_writes(asio::error::bad_descriptor); });
         return;
     }
 
     writing_ = true;
+    in_flight_.reset(new write_item(std::move(write_queue_.front())));
+    write_queue_.pop_front();
+
     auto self = shared_from_this();
     asio::async_write(socket_,
-        asio::buffer(write_queue_.front().buffer),
+        asio::buffer(in_flight_->buffer),
         [this, self](const asio::error_code& ec, std::size_t /*bytes*/) {
-            // The buffer being written lives in the queue and is only released
+            if (!in_flight_) {
+                // close() already took it over and reported the failure.
+                return;
+            }
+            // The buffer being written lives in in_flight_ and is only released
             // here, once asio is done with it -- this is what makes passing a
             // temporary serialized packet safe.
-            write_item item = std::move(write_queue_.front());
-            write_queue_.pop_front();
+            std::unique_ptr<write_item> item(std::move(in_flight_));
             writing_ = false;
 
-            if (item.handler) {
-                item.handler(ec);
+            if (item->handler) {
+                item->handler(ec);
             }
 
-            if (!writing_ && !write_queue_.empty()) {
+            if (ec) {
+                // The stream is unusable (e.g. a close() racing this write, or a
+                // reset peer): drop the socket so later writes fail fast instead
+                // of waiting for writability that never comes.
+                asio::error_code ignored;
+                socket_.close(ignored);
+                state_ = connection_state::disconnected;
+                fail_pending_writes(ec);
+            } else if (!writing_ && !write_queue_.empty()) {
                 do_write();
             }
         });
@@ -321,9 +362,27 @@ inline void connection::mark_connected() {
 }
 
 inline void connection::close() {
+    if (closed_) {
+        return;
+    }
+    closed_ = true;
+
+    // Closing the socket cancels the write that is in flight; its completion
+    // handler sees an empty in_flight_ and stays quiet.
     asio::error_code ec;
     socket_.close(ec);
     state_ = connection_state::disconnected;
+
+    // Fail everything that is still pending.  Queued handlers may hold a
+    // shared_ptr to the owner of this connection (mqtt_client owns it), so an
+    // item left in the queue would form a cycle neither object can break; the
+    // caller also has to hear about the failure rather than wait forever.
+    std::unique_ptr<write_item> in_flight(std::move(in_flight_));
+    writing_ = false;
+    fail_pending_writes(asio::error::operation_aborted);
+    if (in_flight && in_flight->handler) {
+        in_flight->handler(asio::error::operation_aborted);
+    }
 
     if (close_handler_) {
         close_handler_();

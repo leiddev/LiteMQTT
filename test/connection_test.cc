@@ -157,3 +157,43 @@ TEST(ConnectionFraming, ParsesOneTwoAndThreeByteRemainingLengths) {
         EXPECT_EQ(got[i].payload, std::string(payload_sizes[i], 'B')) << "message " << i;
     }
 }
+
+// A write that can never make progress must be reported back, not parked in the
+// queue: the handler usually holds its owner (mqtt_client holds the connection),
+// so a stranded item is both a silent lost callback and a reference cycle.
+TEST(ConnectionWriteQueue, FailsWritesThatCannotBeSent) {
+    asio::io_context io;
+    auto conn = std::make_shared<litemqtt::connection>(io);
+
+    std::atomic<int> calls{0};
+    std::atomic<int> errors{0};
+    auto handler = [&calls, &errors](const asio::error_code& ec) {
+        ++calls;
+        if (ec) {
+            ++errors;
+        }
+    };
+
+    // Never connected: there is no socket, so nothing can drain the queue.
+    conn->async_write_packet({0x10, 0x00}, handler);
+    conn->async_write_packet({0x10, 0x00}, handler);
+    for (int i = 0; i < 200 && calls.load() < 2; ++i) {
+        io.poll();
+        std::this_thread::sleep_for(milliseconds(5));
+    }
+    EXPECT_EQ(calls.load(), 2) << "writes on an unusable socket were never reported";
+    EXPECT_EQ(errors.load(), 2) << "the failures were reported as success";
+
+    // ... and so is anything written after close().
+    calls.store(0);
+    errors.store(0);
+    conn->close();
+    io.restart();  // poll() marks the context stopped once it runs out of work
+    conn->async_write_packet({0x10, 0x00}, handler);
+    for (int i = 0; i < 200 && calls.load() < 1; ++i) {
+        io.poll();
+        std::this_thread::sleep_for(milliseconds(5));
+    }
+    EXPECT_EQ(calls.load(), 1) << "a write queued after close() was dropped";
+    EXPECT_EQ(errors.load(), 1);
+}

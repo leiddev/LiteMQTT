@@ -446,6 +446,13 @@ inline void mqtt_helper::release_client() {
     client->on_message(nullptr);
     client->on_close(nullptr);
     client->on_connect(nullptr);
+
+    // The io thread is gone at this point, so this is the last chance to fail
+    // writes that will never complete (a peer that stopped reading, a socket that
+    // never became writable).  Those handlers hold the client, and the client
+    // holds the connection that owns them: left pending, they form a cycle that
+    // outlives both.
+    client->close();
 }
 
 inline void mqtt_helper::setup_callbacks() {
