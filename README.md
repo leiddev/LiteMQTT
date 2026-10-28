@@ -46,10 +46,14 @@ LiteMQTT/
 │       ├── error.hpp
 │       ├── log.hpp         # Log levels, callback interface & default sink
 │       └── mqtt_helper.hpp # High-level helper with auto-reconnect
-└── test/
-    ├── codec_test.cc       # GoogleTest unit tests
-    ├── client_test.cc
-    └── log_test.cc
+├── test/
+│   ├── codec_test.cc       # GoogleTest unit tests
+│   ├── client_test.cc
+│   ├── connection_test.cc  # Framing, write serialization
+│   ├── helper_test.cc      # Lifetime, stop()/start(), backoff
+│   └── log_test.cc
+└── tools/
+    └── reconnect_probe.cc  # Reconnect / leak probe suite
 ```
 
 ## Build
@@ -64,7 +68,9 @@ cmake --build build
 The build produces:
 
 - `LiteMQTTDemo` – the demo client (`main.cc`)
-- `codec_test`, `client_test`, `log_test` – unit tests (if GoogleTest is available)
+- `reconnect_probe` – reconnect / leak probe suite (`tools/`)
+- `codec_test`, `client_test`, `connection_test`, `helper_test`, `log_test` – unit tests
+  (if GoogleTest is available)
 
 ## Running
 
@@ -89,6 +95,37 @@ With authentication:
 ```
 
 Press Ctrl-C to disconnect and exit.
+
+## Reconnect Probes
+
+`reconnect_probe` exercises the failure modes that unit tests cannot observe: it
+spins up a tiny broker on loopback, breaks the link in a specific way and prints
+the numbers that decide pass/fail.
+
+```bash
+./reconnect_probe --help      # list scenarios
+./reconnect_probe framing     # one scenario
+./reconnect_probe all         # everything, with a PASS/FAIL summary
+```
+
+| Scenario      | What it checks                                                        |
+|---------------|-----------------------------------------------------------------------|
+| `reconnect`   | Broker drops the link repeatedly; the helper must come back.           |
+| `leak`        | The helper must be destroyed after `stop()` and releasing it.          |
+| `leak_nostop` | Dropping the last owner **without** `stop()` must not leak the thread. |
+| `stoplag`     | `stop()` must not block while a long backoff timer is armed.           |
+| `restart`     | `start()` after `stop()` must connect again.                           |
+| `selfstop`    | Calling `stop()` from the io thread (inside a callback) must be safe.  |
+| `badcreds`    | A CONNECT rejected by the broker must close the session immediately.   |
+| `framing`     | Many large writes plus broker-side QoS 1 pushes must stay in sync.     |
+| `backoff`     | The io thread must stay responsive during the backoff wait.            |
+| `giveup`      | A later `start()` must reset the attempt counter after giving up.       |
+| `bigmsg`      | Inbound PUBLISH with 1/2/3 byte remaining lengths parse correctly.     |
+| `bigpub`      | Large publishes into a stalled peer must not corrupt the stream.       |
+
+Scenarios listen on `127.0.0.1` at `18840 + slot`; export
+`LITEMQTT_PROBE_PORT_BASE` to move the whole block. Exit code `0` means the
+observed behaviour matched expectations.
 
 ## Usage Example
 

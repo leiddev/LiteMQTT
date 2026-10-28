@@ -28,6 +28,12 @@ target_include_directories(LiteMQTTDemo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/inc)
 target_link_libraries(LiteMQTTDemo asio)
 target_compile_definitions(LiteMQTTDemo PRIVATE ASIO_STANDALONE _WIN32_WINNT=0x0601)
 
+# Reconnect probe suite: manual tool (binds loopback ports), not part of ctest.
+add_executable(reconnect_probe tools/reconnect_probe.cc)
+target_include_directories(reconnect_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/inc)
+target_link_libraries(reconnect_probe asio)
+target_compile_definitions(reconnect_probe PRIVATE ASIO_STANDALONE _WIN32_WINNT=0x0601)
+
 # Unit tests
 enable_testing()
 find_package(GTest QUIET)
