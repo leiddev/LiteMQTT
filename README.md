@@ -154,7 +154,20 @@ scripted schedule and publishes QoS 1 messages at a fixed rate the whole time.
 | `blackhole` | The listener accepts and then goes silent (no CONNACK, no reads).      |
 | `weak`      | Slow reads plus short outages — a weak link, not a dead one.           |
 | `mixed`     | All of the above in one schedule.                                      |
-| `soak`      | A long, slow churn for endurance runs.                                 |
+| `soak`      | Same schedule as `mixed`; use it for long endurance runs.              |
+
+The broker listens on `127.0.0.1` and asks the OS for a free port, so two runs
+can never share traffic — the client is always pointed at its own broker. Pin
+a port with `--port N` when you want to watch the wire (tcpdump) or reproduce
+a specific setup. If the port cannot be bound the tool exits with status 2
+instead of quietly measuring a listener owned by another process, and losing
+the port in the middle of a run (an outage closes the listener, so a second
+run can grab it) fails the run rather than reporting numbers from a broker
+that never saw the traffic.
+
+Give it at least ~30 s: `weak` and `mixed` start with a few seconds of weak but
+working link, so a very short run can finish without ever reaching an outage —
+and then fails the "link broke and came back" check on its own merits.
 
 Every publish must be answered exactly once, and the summary checks that the
 broker saw no framing or ordering errors, that the link really did break and

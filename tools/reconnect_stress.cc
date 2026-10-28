@@ -133,13 +133,28 @@ const char* to_string(link_state s) {
 
 class chaos_broker {
 public:
-    explicit chaos_broker(uint16_t port) : port_(port), acceptor_(io_) {
+    // 0 asks the OS for a free port, which is what makes concurrent runs safe: the
+    // client talks to this process' own listener and nobody else's.
+    explicit chaos_broker(int port) : port_(port), acceptor_(io_) {
         work_.reset(new asio::io_context::work(io_));
     }
 
     ~chaos_broker() { shutdown(); }
 
-    void start() { thread_ = std::thread([this]() { io_.run(); }); }
+    // Binds the listener on the calling thread and reports whether we own the port,
+    // *before* the client is allowed to connect.  A silent bind failure used to leave
+    // the client talking to whatever else held the port (a previous run, another
+    // harness), and the run then measured someone else's broker: the counters we
+    // print would come from a broker that never saw those publishes.
+    bool start() {
+        if (!open_listener()) return false;
+        thread_ = std::thread([this]() { io_.run(); });
+        return true;
+    }
+
+    // The port the broker actually owns (resolved after the first bind when 0 was asked
+    // for); valid once start() has returned true.
+    int port() const { return port_; }
 
     void shutdown() {
         if (!thread_.joinable()) return;
@@ -171,6 +186,9 @@ public:
     int resets() const { return resets_.load(); }
     int held_blackholes() const { return held_.load(); }
     link_state state_snapshot() const { return state_.load(); }
+    // Set when the broker lost the port mid-run: every counter from then on describes
+    // a different process, so the driver has to stop rather than report numbers.
+    bool fatal() const { return fatal_.load(); }
 
 private:
     struct session : std::enable_shared_from_this<session> {
@@ -191,23 +209,66 @@ private:
             close_sessions();
             return;
         }
-        if (!acceptor_.is_open()) {
-            asio::error_code ec;
-            acceptor_.open(asio::ip::tcp::v4(), ec);
-            if (ec) return;
-            acceptor_.set_option(asio::ip::tcp::acceptor::reuse_address(true), ec);
-            acceptor_.bind(asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port_), ec);
-            if (ec) {
-                std::printf("  [broker] re-bind failed: %s\n", ec.message().c_str());
-                return;
-            }
-            acceptor_.listen(asio::socket_base::max_connections, ec);
+        if (!acceptor_.is_open() && !open_listener()) {
+            // Losing the port between an outage and the recovery means the client will
+            // reconnect to somebody else's listener; the run is meaningless from here.
+            fatal_.store(true);
+            io_.stop();
+            return;
         }
         if (s == link_state::blackhole) {
             // Old sessions die, new ones are accepted and then ignored.
             close_sessions();
         }
         do_accept();
+    }
+
+    // Open / bind / listen the announced port.  Returns false (after printing why)
+    // when we do not own it, which the caller treats as fatal.
+    bool open_listener() {
+        asio::error_code ec;
+        acceptor_.open(asio::ip::tcp::v4(), ec);
+        if (ec) {
+            std::printf("  [broker] cannot open the listener: %s\n", ec.message().c_str());
+            return false;
+        }
+#if defined(_WIN32)
+        // Windows treats SO_REUSEADDR as "another process may also bind this port", and
+        // then hands connections to whichever socket wins the race -- a second run would
+        // steal half of the first one's sessions.  SO_EXCLUSIVEADDRUSE makes the second
+        // bind fail, which is what tells us the port is not ours.
+        {
+            BOOL exclusive = TRUE;
+            ::setsockopt(acceptor_.native_handle(), SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                         reinterpret_cast<const char*>(&exclusive), sizeof(exclusive));
+        }
+#else
+        // Needed on POSIX so accepted sockets left in TIME_WAIT by the previous outage do
+        // not stop us from re-binding the same port.
+        acceptor_.set_option(asio::ip::tcp::acceptor::reuse_address(true), ec);
+#endif
+        acceptor_.bind(asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port_), ec);
+        if (ec) {
+            std::printf("  [broker] cannot bind port %u: %s\n", (unsigned)port_,
+                        ec.message().c_str());
+            // Do not leave a half-open socket behind: the next attempt must be a clean
+            // open/bind, not a retry on this one.
+            asio::error_code ignored;
+            acceptor_.close(ignored);
+            return false;
+        }
+        // port_ == 0 meant "any free port": remember what the OS picked so that the
+        // re-bind after a scripted outage goes back to the port the client knows.
+        asio::error_code lec;
+        const int bound = acceptor_.local_endpoint(lec).port();
+        if (!lec && bound > 0) port_ = bound;
+        acceptor_.listen(asio::socket_base::max_connections, ec);
+        if (ec) {
+            std::printf("  [broker] cannot listen on port %u: %s\n", (unsigned)port_,
+                        ec.message().c_str());
+            return false;
+        }
+        return true;
     }
 
     void do_accept() {
@@ -400,7 +461,7 @@ private:
                           [self, data](const asio::error_code&, std::size_t) {});
     }
 
-    uint16_t port_;
+    int port_;
     asio::io_context io_;
     asio::ip::tcp::acceptor acceptor_;
     std::unique_ptr<asio::io_context::work> work_;
@@ -408,6 +469,7 @@ private:
     std::vector<std::shared_ptr<session>> sessions_;
     bool accepting_ = false;
     std::atomic<link_state> state_{link_state::up};
+    std::atomic<bool> fatal_{false};
 
     std::atomic<int> accepted_{0};
     std::atomic<int> connacks_{0};
@@ -458,6 +520,7 @@ struct options {
     int max_attempts = -1;
     int connect_timeout_ms = 2000;
     long rss_limit_mb = 32;
+    int port = 0;   // 0 = let the OS pick one (concurrent runs stay independent)
 };
 
 void print_usage() {
@@ -465,7 +528,7 @@ void print_usage() {
         "usage: reconnect_stress [--scenario NAME] [--duration SECONDS] [--rate HZ]\n"
         "                        [--payload BYTES] [--reconnect-delay MS]\n"
         "                        [--max-attempts N] [--connect-timeout MS]\n"
-        "                        [--rss-limit-mb N]\n"
+        "                        [--rss-limit-mb N] [--port N]\n"
         "\n"
         "scenarios (all publish continuously while the link misbehaves):\n"
         "  flap      short outages, ~0.5 s up / ~0.5 s down\n"
@@ -475,7 +538,14 @@ void print_usage() {
         "  mixed     everything above in one run (used for soak testing)\n"
         "  soak      alias of mixed\n"
         "\n"
+        "the broker listens on 127.0.0.1 and picks a free port unless --port is given;\n"
+        "the client is always pointed at that broker, so runs never share traffic.\n"
+        "give it at least ~30 s: weak/mixed start with a weak-but-working link, so a\n"
+        "very short run can finish without ever reaching an outage (and then fails\n"
+        "the \"link broke and came back\" check by design).\n"
+        "\n"
         "exit code 0 = no lost callbacks, no descriptor/thread leak, stable RSS\n"
+        "exit code 2 = --port is already taken by another process\n"
         "\n"
         "note: under AddressSanitizer the RSS check is meaningless (shadow memory and\n"
         "      quarantine), so raise or disable it with a large --rss-limit-mb value;\n"
@@ -551,6 +621,12 @@ int main(int argc, char** argv) {
             opt.max_attempts = std::atoi(next());
         } else if (a == "--connect-timeout") {
             opt.connect_timeout_ms = std::atoi(next());
+        } else if (a == "--port") {
+            opt.port = std::atoi(next());
+            if (opt.port < 0 || opt.port > 65535) {
+                std::printf("--port needs a value between 0 (any free port) and 65535\n");
+                return 2;
+            }
         } else if (a == "--rss-limit-mb") {
             opt.rss_limit_mb = std::atol(next());
             if (opt.rss_limit_mb <= 0) opt.rss_limit_mb = 1;
@@ -568,7 +644,6 @@ int main(int argc, char** argv) {
                 opt.scenario.c_str(), opt.duration_s, opt.rate_hz, opt.payload,
                 opt.reconnect_delay_ms, opt.max_attempts, opt.connect_timeout_ms);
 
-    const uint16_t port = 18860;
     const int fds_before = count_fds();
     const int threads_before = count_threads();
     const long rss_before = rss_kb();
@@ -579,6 +654,7 @@ int main(int argc, char** argv) {
     long max_rss = 0;
     int b_accepted = 0;
     int b_connacks = 0;
+    bool b_fatal = false;
     int b_publishes = 0;
     int b_pubacks = 0;
     int b_framing_errors = 0;
@@ -592,8 +668,17 @@ int main(int argc, char** argv) {
         // Kept in this scope so that both the broker and the helper are gone before
         // the final descriptor count: an io_context owns an epoll descriptor, which
         // would otherwise look like a leak of the run.
-        std::unique_ptr<chaos_broker> broker(new chaos_broker(port));
-        broker->start();
+        std::unique_ptr<chaos_broker> broker(new chaos_broker(opt.port));
+        if (!broker->start()) {
+            // Do not go on: the client would connect to whoever owns this port and every
+            // number below would describe that listener instead of this run.
+            std::printf("\n*** port %u is not available -- is another reconnect_stress "
+                        "running?  Drop --port to let the OS pick a free one. ***\n",
+                        (unsigned)opt.port);
+            return 2;
+        }
+        const uint16_t port = static_cast<uint16_t>(broker->port());
+        std::printf("broker listening on 127.0.0.1:%u\n", (unsigned)port);
 
         auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", port, "stress");
         helper->set_connect_timeout(opt.connect_timeout_ms);
@@ -646,6 +731,13 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(milliseconds(50));
             const auto now = steady_clock::now();
 
+            if (broker->fatal()) {
+                // The broker lost the port: from here on the client talks to someone
+                // else and the numbers below would be fiction.  Stop and fail.
+                std::printf("  [broker] lost port %u mid-run -- aborting\n", (unsigned)port);
+                break;
+            }
+
             if (!schedule.empty() &&
                 now - step_started > milliseconds(schedule[step].duration_ms)) {
                 ++step;
@@ -694,6 +786,7 @@ int main(int argc, char** argv) {
 
         b_accepted = broker->accepted();
         b_connacks = broker->connacks();
+        b_fatal = broker->fatal();
         b_publishes = broker->publishes();
         b_pubacks = broker->pubacks();
         b_framing_errors = broker->framing_errors();
@@ -732,6 +825,7 @@ int main(int argc, char** argv) {
 
     check(still_pending == 0, "every publish was reported back");
     check(stats.duplicates == 0, "no publish was reported twice");
+    check(!b_fatal, "the broker kept the port for the whole run");
     check(stats.succeeded > 0, "some publishes actually went through");
     check(b_publishes > 0, "the broker received publishes");
     check(b_framing_errors == 0, "the byte stream stayed in sync");
