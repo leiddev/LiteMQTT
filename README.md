@@ -20,7 +20,8 @@ A lightweight, header-only MQTT v3.1.1 client library written in C++14, powered 
 - **Pluggable logging** - install a log callback to forward all library messages
   to your own logging backend (see [Logging](#logging))
 - **mqtt_helper** - High-level convenience wrapper with:
-  - Automatic connection & reconnection with exponential backoff
+  - Automatic connection & reconnection: unlimited or capped attempts,
+    exponential or fixed backoff, re-armable after giving up
   - Thread-safe io_context management
   - Subscription persistence across reconnects
   - Simple blocking-style API for easy integration
@@ -120,6 +121,8 @@ the numbers that decide pass/fail.
 | `framing`     | Many large writes plus broker-side QoS 1 pushes must stay in sync.     |
 | `backoff`     | The io thread must stay responsive during the backoff wait.            |
 | `giveup`      | A later `start()` must reset the attempt counter after giving up.       |
+| `rearm`       | `rearm_reconnect()` resumes retrying after the limit was hit.          |
+| `fixed_delay` | `set_reconnect_config(-1, 3000)` retries forever, every 3 s.           |
 | `bigmsg`      | Inbound PUBLISH with 1/2/3 byte remaining lengths parse correctly.     |
 | `bigpub`      | Large publishes into a stalled peer must not corrupt the stream.       |
 
@@ -173,6 +176,7 @@ int main() {
     helper->set_credentials("myuser", "mypass");
     helper->set_keep_alive(60);
     helper->set_reconnect_config(10, 1000);  // max 10 attempts, 1s base delay
+    // helper->set_reconnect_config(-1, 3000);  // or: retry forever, every 3 s
 
     helper->on_message([](std::string topic, std::string payload,
                           uint8_t qos, uint16_t packet_id) {
@@ -184,9 +188,28 @@ int main() {
 
     // Application runs independently, reconnection handled automatically
     std::this_thread::sleep_for(std::chrono::seconds(300));
+
+    // With a finite max_attempts the helper eventually gives up (it logs a warn
+    // and is_reconnect_armed() turns false) but keeps running, so the session can
+    // be revived without tearing the io thread down:
+    if (!helper->is_reconnect_armed()) {
+        helper->rearm_reconnect();  // resets the counter, retries immediately
+    }
+
     helper->stop();
 }
 ```
+
+`set_reconnect_config(max_attempts, base_delay_ms)`:
+
+| `max_attempts` | Behaviour                                                                 |
+|----------------|---------------------------------------------------------------------------|
+| `-1`           | Retry forever, always waiting `base_delay_ms` (no exponential growth).     |
+| `>= 0`         | Give up after that many consecutive failures; the delay grows as `base_delay_ms * 2^attempt`, capped at 30 s. A successful connect resets the counter. |
+
+After giving up, `is_reconnect_armed()` returns `false` and `rearm_reconnect()`
+puts the helper back to work (returns `false` if it is not running, in which case
+`start()` is what you need). Both are safe to call from any thread.
 
 ## Logging
 

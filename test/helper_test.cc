@@ -6,8 +6,10 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "litemqtt/mqtt_helper.hpp"
 
@@ -131,4 +133,80 @@ TEST(MqttHelperLifetime, StopFromIoThreadDoesNotThrow) {
     EXPECT_FALSE(threw.load()) << "stop() from the io thread threw";
     EXPECT_FALSE(helper->is_running());
     helper->stop();  // finish the teardown from this thread
+}
+
+// Once the attempt limit was hit nothing retries any more; rearm_reconnect()
+// must resume from a clean counter, without stop() + start().
+TEST(MqttHelperReconnect, RearmRetriesAfterGivingUp) {
+    auto helper = make_helper("rearm");
+    std::atomic<int> backoffs{0};
+    std::atomic<int> giveups{0};
+    helper->set_log_handler([&backoffs, &giveups](const litemqtt::log_record& r) {
+        if (r.message.find("Reconnecting in") != std::string::npos) ++backoffs;
+        if (r.message.find("giving up") != std::string::npos) ++giveups;
+    });
+    helper->set_reconnect_config(1, 10);
+    helper->start();
+
+    ASSERT_TRUE(wait_for([&helper]() { return !helper->is_reconnect_armed(); }, 2000))
+        << "the helper never gave up";
+    EXPECT_FALSE(helper->is_connected());
+    EXPECT_TRUE(helper->is_running()) << "giving up must not stop the io thread";
+
+    const int backoffs_before = backoffs.load();
+    const int giveups_before = giveups.load();
+    EXPECT_GE(backoffs_before, 1);
+
+    // Given up means given up: no retry happens on its own any more.
+    std::this_thread::sleep_for(milliseconds(200));
+    EXPECT_EQ(backoffs.load(), backoffs_before);
+
+    EXPECT_TRUE(helper->rearm_reconnect());
+    EXPECT_TRUE(helper->is_reconnect_armed()) << "re-arm left the flag cleared";
+    EXPECT_TRUE(wait_for([&backoffs, backoffs_before]() { return backoffs.load() > backoffs_before; },
+                         2000))
+        << "no retry after rearm_reconnect()";
+    EXPECT_TRUE(wait_for([&giveups, giveups_before]() { return giveups.load() > giveups_before; },
+                         2000))
+        << "the counter was not reset: the fresh budget was not used up again";
+
+    helper->stop();
+    EXPECT_FALSE(helper->rearm_reconnect()) << "rearm must be refused once stopped";
+}
+
+// set_reconnect_config(-1, delay): retry forever, always at the same delay.
+TEST(MqttHelperReconnect, UnlimitedWaitsAFixedInterval) {
+    auto helper = make_helper("fixed-delay");
+    std::mutex mutex;
+    std::vector<long long> stamps;
+    std::atomic<int> giveups{0};
+    const auto t0 = steady_clock::now();
+    helper->set_log_handler([&](const litemqtt::log_record& r) {
+        if (r.message.find("Reconnecting in") != std::string::npos) {
+            std::lock_guard<std::mutex> lock(mutex);
+            stamps.push_back(duration_cast<milliseconds>(steady_clock::now() - t0).count());
+        }
+        if (r.message.find("giving up") != std::string::npos) ++giveups;
+    });
+    helper->set_reconnect_config(-1, 100);
+    helper->start();
+
+    const bool got_five = wait_for(
+        [&mutex, &stamps]() {
+            std::lock_guard<std::mutex> lock(mutex);
+            return stamps.size() >= 5;
+        },
+        3000);
+    helper->stop();
+
+    ASSERT_TRUE(got_five) << "(-1, 100) stopped retrying instead of retrying forever";
+    EXPECT_EQ(giveups.load(), 0) << "unlimited mode gave up";
+
+    std::lock_guard<std::mutex> lock(mutex);
+    for (std::size_t i = 1; i < stamps.size(); ++i) {
+        const long long gap = stamps[i] - stamps[i - 1];
+        EXPECT_GE(gap, 90) << "gap before retry " << (i + 1) << " was only " << gap << " ms";
+        EXPECT_LT(gap, 300) << "gap before retry " << (i + 1) << " grew to " << gap
+                            << " ms; unlimited mode must use a constant delay";
+    }
 }

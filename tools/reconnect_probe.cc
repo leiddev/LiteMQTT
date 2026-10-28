@@ -38,6 +38,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -62,6 +63,8 @@ enum port_slot : int {
     slot_framing = 7,
     slot_giveup = 8,
     slot_bigmsg = 9,
+    slot_rearm = 10,
+    slot_fixed_delay = 11,
     slot_backoff = 57,
     slot_stoplag = 58,
     slot_leak = 59,
@@ -367,7 +370,7 @@ int probe_reconnect() {
     install_logger("client");
     dummy_broker broker(probe_port(slot_reconnect), 200);
 
-    auto helper = make_helper(slot_reconnect, "$3");
+    auto helper = make_helper(slot_reconnect, "reconnect");
     helper->set_reconnect_config(-1, 50);  // unlimited attempts, 50 ms (fast churn)
     const int fds_before = count_fds();
     helper->start();
@@ -392,7 +395,7 @@ int probe_leak() {
     install_logger("leak");
     std::weak_ptr<litemqtt::mqtt_helper> weak;
     {
-        auto helper = make_helper(slot_leak, "$3");
+        auto helper = make_helper(slot_leak, "leak");
         helper->set_reconnect_config(0, 10);
         helper->start();
         std::this_thread::sleep_for(milliseconds(300));
@@ -412,7 +415,7 @@ int probe_leak_nostop() {
     dummy_broker broker(probe_port(slot_leak_nostop), 10000);
     std::weak_ptr<litemqtt::mqtt_helper> weak;
     {
-        auto helper = make_helper(slot_leak_nostop, "$3");
+        auto helper = make_helper(slot_leak_nostop, "leak_nostop");
         helper->set_reconnect_config(0, 10);
         helper->start();
         std::this_thread::sleep_for(milliseconds(400));
@@ -431,7 +434,7 @@ int probe_leak_nostop() {
 int probe_stoplag() {
     std::puts("=== scenario: how long does stop() block while reconnect backoff sleeps? ===");
     install_logger("lag");
-    auto helper = make_helper(slot_stoplag, "$3");
+    auto helper = make_helper(slot_stoplag, "stoplag");
     helper->set_reconnect_config(-1, 5000);  // 5 s backoff
     helper->start();
     std::this_thread::sleep_for(milliseconds(700));  // now inside the 5 s sleep
@@ -448,7 +451,7 @@ int probe_restart() {
     install_logger("restart");
     dummy_broker broker(probe_port(slot_restart), 5000);  // keep the link up
 
-    auto helper = make_helper(slot_restart, "$3");
+    auto helper = make_helper(slot_restart, "restart");
     helper->set_reconnect_config(0, 10);
     helper->start();
     std::this_thread::sleep_for(milliseconds(500));
@@ -469,7 +472,7 @@ int probe_selfstop() {
     install_logger("self");
     dummy_broker broker(probe_port(slot_selfstop), 10000, /*stall=*/false, /*push_publish=*/true);
 
-    auto helper = make_helper(slot_selfstop, "$3");
+    auto helper = make_helper(slot_selfstop, "selfstop");
     helper->set_reconnect_config(0, 10);
 
     std::atomic<bool> threw{false};
@@ -503,7 +506,7 @@ int probe_badcreds() {
     dummy_broker broker(probe_port(slot_badcreds), 20000, /*stall=*/false, /*push_publish=*/false,
                         /*connack_rc=*/5);
 
-    auto helper = make_helper(slot_badcreds, "$3");
+    auto helper = make_helper(slot_badcreds, "badcreds");
     helper->set_reconnect_config(-1, 300);  // unlimited attempts, 300 ms backoff
     helper->start();
 
@@ -530,7 +533,7 @@ int probe_framing() {
     install_logger("framing");
     framing_broker broker(probe_port(slot_framing));
 
-    auto helper = make_helper(slot_framing, "$3");
+    auto helper = make_helper(slot_framing, "framing");
     helper->set_reconnect_config(0, 10);
     std::atomic<int> acked{0};
     std::atomic<int> received{0};
@@ -559,7 +562,7 @@ int probe_framing() {
 int probe_backoff_liveness() {
     std::puts("=== scenario: is the io thread still alive during a 5 s backoff? ===");
     install_logger("live");
-    auto helper = make_helper(slot_backoff, "$3");
+    auto helper = make_helper(slot_backoff, "backoff");
     helper->set_reconnect_config(-1, 5000);  // 5 s backoff, no broker listening
     helper->start();
     std::this_thread::sleep_for(milliseconds(800));  // now inside the backoff wait
@@ -595,7 +598,7 @@ void install_counting_logger() {
 int probe_giveup_restart() {
     std::puts("=== scenario: start() after the helper gave up must retry again ===");
     install_counting_logger();
-    auto helper = make_helper(slot_giveup, "$3");
+    auto helper = make_helper(slot_giveup, "giveup");
     helper->set_reconnect_config(2, 20);  // two attempts, 20 ms apart
 
     helper->start();
@@ -612,6 +615,106 @@ int probe_giveup_restart() {
                 session2);
     helper->stop();
     return session2 >= 2 ? 0 : 1;
+}
+
+int probe_rearm() {
+    std::puts("=== scenario: rearm_reconnect() after the attempt limit was hit ===");
+    install_logger("client");
+    auto helper = make_helper(slot_rearm, "rearm");
+    // Give up quickly: two attempts, 200 ms apart -- no broker is listening yet.
+    helper->set_reconnect_config(2, 200);
+    helper->start();
+
+    bool gave_up = false;
+    for (int i = 0; i < 30 && !gave_up; ++i) {
+        std::this_thread::sleep_for(milliseconds(100));
+        gave_up = !helper->is_reconnect_armed();
+    }
+    std::printf("--> gave up: %s (running: %s, connected: %s)\n", gave_up ? "yes" : "NO",
+                helper->is_running() ? "yes" : "no", helper->is_connected() ? "yes" : "no");
+
+    // The broker only shows up now.  While given up nothing may retry on its own.
+    dummy_broker broker(probe_port(slot_rearm), 60000);
+    std::this_thread::sleep_for(milliseconds(1000));
+    const bool stayed_down = !helper->is_connected();
+
+    const bool armed = helper->rearm_reconnect();
+    bool connected = false;
+    for (int i = 0; i < 30 && !connected; ++i) {
+        std::this_thread::sleep_for(milliseconds(100));
+        connected = helper->is_connected();
+    }
+    std::printf("--> stayed down while given up: %s, rearm_reconnect()=%s, "
+                "connected afterwards: %s, accepted=%d\n",
+                stayed_down ? "yes" : "NO", armed ? "true" : "false",
+                connected ? "yes" : "NO", broker.accepted());
+
+    // Idempotent while armed, refused once stopped.
+    const bool again = helper->rearm_reconnect();
+    helper->stop();
+    const bool after_stop = helper->rearm_reconnect();
+    std::printf("--> rearm again while armed: %s, rearm after stop(): %s\n",
+                again ? "true" : "FALSE", after_stop ? "TRUE" : "false");
+
+    return (gave_up && stayed_down && armed && connected && again && !after_stop) ? 0 : 1;
+}
+
+int probe_fixed_delay() {
+    std::puts("=== scenario: set_reconnect_config(-1, 3000) retries forever every 3 s ===");
+    // Record when each backoff announcement is logged, to time the interval.
+    std::mutex mutex;
+    std::vector<long long> stamps;
+    const auto t0 = steady_clock::now();
+    litemqtt::set_log_handler([&mutex, &stamps, t0](const litemqtt::log_record& r) {
+        std::printf("  [client][%s] %s\n", litemqtt::to_string(r.level), r.message.c_str());
+        if (r.message.find("Reconnecting in") != std::string::npos) {
+            std::lock_guard<std::mutex> lock(mutex);
+            stamps.push_back(duration_cast<milliseconds>(steady_clock::now() - t0).count());
+        }
+    });
+
+    auto helper = make_helper(slot_fixed_delay, "fixed_delay");
+    helper->set_reconnect_config(-1, 3000);
+    helper->start();
+
+    std::this_thread::sleep_for(milliseconds(7000));  // ~3 retries, no broker yet
+    std::size_t early = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        early = stamps.size();
+    }
+
+    // Still churning four seconds later: an attempt limit would have stopped it.
+    std::this_thread::sleep_for(milliseconds(3500));
+    std::vector<long long> all;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        all = stamps;
+    }
+
+    bool interval_ok = all.size() >= 2;
+    for (std::size_t i = 1; i < all.size(); ++i) {
+        const long long delta = all[i] - all[i - 1];
+        std::printf("     retry %zu logged %lld ms after the previous one\n", i + 1, delta);
+        if (delta < 2900 || delta > 3600) interval_ok = false;
+    }
+    std::printf("--> retries after 7 s: %zu, after 10.5 s: %zu (still retrying: %s), "
+                "interval ~3000 ms: %s\n",
+                early, all.size(), all.size() > early ? "yes" : "NO",
+                interval_ok ? "yes" : "NO");
+
+    // Let a broker appear: the unlimited loop has to pick it up by itself.
+    dummy_broker broker(probe_port(slot_fixed_delay), 60000);
+    bool connected = false;
+    for (int i = 0; i < 60 && !connected; ++i) {
+        std::this_thread::sleep_for(milliseconds(100));
+        connected = helper->is_connected();
+    }
+    std::printf("--> connected once the broker appeared: %s (accepted=%d)\n",
+                connected ? "yes" : "NO", broker.accepted());
+    helper->stop();
+
+    return (early >= 3 && interval_ok && all.size() > early && connected) ? 0 : 1;
 }
 
 int probe_bigmsg() {
@@ -658,7 +761,7 @@ int probe_bigmsg() {
         sock->close(ec);
     });
 
-    auto helper = make_helper(slot_bigmsg, "$3");
+    auto helper = make_helper(slot_bigmsg, "bigmsg");
     helper->set_reconnect_config(0, 10);
     std::atomic<int> n{0};
     std::atomic<int> mismatches{0};
@@ -690,7 +793,7 @@ int probe_bigpub() {
     std::puts("=== scenario: large publish while the broker stalls (deferred async_write) ===");
     install_logger("bigpub");
     dummy_broker broker(probe_port(slot_bigpub), 10000, /*stall=*/true);
-    auto helper = make_helper(slot_bigpub, "$3");
+    auto helper = make_helper(slot_bigpub, "bigpub");
     helper->set_reconnect_config(0, 10);
     helper->start();
     std::this_thread::sleep_for(milliseconds(400));
@@ -724,6 +827,8 @@ const scenario g_scenarios[] = {
     {"framing", "200 x 32 KiB publishes while the broker pushes QoS1", probe_framing},
     {"backoff", "is the io thread responsive during a 5 s backoff?", probe_backoff_liveness},
     {"giveup", "are the attempts reset by a later start()?", probe_giveup_restart},
+    {"rearm", "rearm_reconnect() resumes after the attempt limit", probe_rearm},
+    {"fixed_delay", "set_reconnect_config(-1, 3000) keeps retrying", probe_fixed_delay},
     {"bigmsg", "inbound PUBLISH with 1/2/3 byte remaining lengths", probe_bigmsg},
     {"bigpub", "3 x 4 MiB publish into a stalled peer", probe_bigpub},
 };

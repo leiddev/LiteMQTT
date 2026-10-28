@@ -42,6 +42,14 @@ public:
     void set_credentials(const std::string& username, const std::string& password);
     void set_keep_alive(uint16_t seconds);
     void set_clean_session(bool clean);
+    /// Automatic reconnection policy; configure it before start().
+    ///   max_attempts == -1  retry forever, always waiting base_delay_ms
+    ///                       (no exponential growth)
+    ///   max_attempts >= 0   give up after that many consecutive failures, the
+    ///                       delay growing as base_delay_ms * 2^attempt, capped
+    ///                       at 30 s; a successful connect resets the counter
+    /// After giving up, call rearm_reconnect() (or stop() + start()).
+    /// A negative base_delay_ms is treated as 0.
     void set_reconnect_config(int max_attempts, int base_delay_ms);
 
     // Core operations
@@ -60,6 +68,22 @@ public:
     void stop();
     bool is_connected() const;
     bool is_running() const;
+
+    /// True while automatic reconnection is armed: the helper is running, was
+    /// not stopped by the user, and has not given up.  do_reconnect() clears
+    /// this when max_attempts is exhausted (see set_reconnect_config()).
+    bool is_reconnect_armed() const;
+
+    /// Re-arms automatic reconnection after do_reconnect() gave up because
+    /// max_attempts was exhausted: resets the attempt counter and starts a new
+    /// connection attempt right away (no backoff wait, no stop()/start(), so the
+    /// io thread, the io_context and the subscriptions are kept).
+    ///
+    /// Returns true when the helper is retrying afterwards, false when it cannot
+    /// (never started, or stopped -- call start() instead).  Calling it while a
+    /// retry is already armed is a no-op that returns true.  Safe to call from
+    /// any thread.
+    bool rearm_reconnect();
 
     /// Per-helper log sink.  Takes precedence over the process wide handler
     /// installed with litemqtt::set_log_handler() for records emitted by this
@@ -151,8 +175,10 @@ inline void mqtt_helper::set_clean_session(bool clean) {
 
 inline void mqtt_helper::set_reconnect_config(int max_attempts,
                                               int base_delay_ms) {
-    max_reconnect_attempts_ = max_attempts;
-    base_reconnect_delay_ms_ = base_delay_ms;
+    // -1 means unlimited; anything below it is meaningless, so normalise it to 0
+    // (give up on the first failure, which is a legal configuration).
+    max_reconnect_attempts_ = (max_attempts < -1) ? 0 : max_attempts;
+    base_reconnect_delay_ms_ = (base_delay_ms < 0) ? 0 : base_delay_ms;
 }
 
 inline void mqtt_helper::set_log_handler(log_handler handler) {
@@ -318,6 +344,51 @@ inline bool mqtt_helper::is_running() const {
     return running_.load();
 }
 
+inline bool mqtt_helper::is_reconnect_armed() const {
+    return running_.load() && should_reconnect_.load();
+}
+
+inline bool mqtt_helper::rearm_reconnect() {
+    if (!running_.load() || user_stopped_.load()) {
+        LITEMQTT_LOG_TO(log_channel_, log_level::warn)
+            << "[mqtt_helper] rearm_reconnect() ignored: helper is not running";
+        return false;
+    }
+
+    // Only the give-up path clears this flag.  When a retry is already armed,
+    // doing nothing keeps the call idempotent and avoids a second connect
+    // attempt racing with the pending backoff timer.
+    bool expected = false;
+    if (!should_reconnect_.compare_exchange_strong(expected, true)) {
+        LITEMQTT_LOG_TO(log_channel_, log_level::debug)
+            << "[mqtt_helper] rearm_reconnect(): already armed";
+        return true;
+    }
+
+    reconnect_attempts_.store(0);
+    initial_connect_.store(false);
+
+    LITEMQTT_LOG_TO(log_channel_, log_level::info)
+        << "[mqtt_helper] Reconnect re-armed, retrying immediately";
+
+    // Hop onto the io thread: do_connect() and the client's state are not
+    // thread-safe, and cancelling a timer is only safe from its own thread.
+    std::weak_ptr<mqtt_helper> weak = shared_from_this();
+    asio::post(io_, [weak]() {
+        auto self = weak.lock();
+        if (!self) {
+            return;
+        }
+        if (!self->should_reconnect_.load() || self->user_stopped_.load()) {
+            return;  // stop() won the race
+        }
+        asio::error_code ec;
+        self->reconnect_timer_.cancel(ec);
+        self->do_connect();
+    });
+    return true;
+}
+
 inline void mqtt_helper::init_client() {
     auto client = std::make_shared<mqtt_client>(io_);
     client->set_client_id(client_id_);
@@ -477,7 +548,7 @@ inline void mqtt_helper::do_reconnect() {
     if ((max_reconnect_attempts_ != -1) && (attempts >= max_reconnect_attempts_)) {
         LITEMQTT_LOG_TO(log_channel_, log_level::warn)
             << "[mqtt_helper] Max reconnect attempts reached (" << max_reconnect_attempts_
-            << "), giving up";
+            << "), giving up; call rearm_reconnect() to try again";
         should_reconnect_.store(false);
         return;
     }
@@ -494,11 +565,24 @@ inline void mqtt_helper::do_reconnect() {
         delay_ms = static_cast<int>(std::min<long long>(grown, 30000));
     }
     
-    reconnect_attempts_.fetch_add(1);
+    // Saturate rather than overflow: with max_attempts == -1 a helper that keeps
+    // failing for days would otherwise eventually wrap the counter (UB), and the
+    // value is only used for the log line and for the backoff growth anyway.
+    if (attempts < 1000000) {
+        reconnect_attempts_.fetch_add(1);
+    }
 
-    LITEMQTT_LOG_TO(log_channel_, log_level::info)
-        << "[mqtt_helper] Reconnecting in " << delay_ms << "ms (attempt " << (attempts + 1) << "/"
-        << max_reconnect_attempts_ << ")...";
+    const int attempt_no = attempts + 1;
+    if (max_reconnect_attempts_ == -1) {
+        // Unlimited mode retries at a constant interval -- no exponential growth.
+        LITEMQTT_LOG_TO(log_channel_, log_level::info)
+            << "[mqtt_helper] Reconnecting in " << delay_ms << "ms (attempt " << attempt_no
+            << ", unlimited)...";
+    } else {
+        LITEMQTT_LOG_TO(log_channel_, log_level::info)
+            << "[mqtt_helper] Reconnecting in " << delay_ms << "ms (attempt " << attempt_no << "/"
+            << max_reconnect_attempts_ << ")...";
+    }
 
     // Wait asynchronously instead of sleeping on the io thread.  A sleep would
     // freeze reads, writes, ping and timers for the whole backoff window, and
