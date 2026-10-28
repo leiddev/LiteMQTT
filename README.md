@@ -1,5 +1,7 @@
 # LiteMQTT
 
+[![CI](https://github.com/leiddev/LiteMQTT/actions/workflows/ci.yml/badge.svg)](https://github.com/leiddev/LiteMQTT/actions/workflows/ci.yml)
+
 A lightweight, header-only MQTT v3.1.1 client library written in C++14, powered by Asio.
 
 ## Features
@@ -74,6 +76,34 @@ The build produces:
 - `reconnect_stress` – publish-while-reconnecting stress harness (`tools/`)
 - `codec_test`, `client_test`, `connection_test`, `helper_test`, `log_test` – unit tests
   (if GoogleTest is available)
+
+GoogleTest is optional so the library and the demo build anywhere. Two options make
+that explicit, which is what CI uses:
+
+| Option | Effect |
+|--------|--------|
+| `-DLITEMQTT_REQUIRE_TESTS=ON` | fail configure instead of quietly skipping the tests when GoogleTest is missing |
+| `-DLITEMQTT_FETCH_GTEST=ON`   | download googletest (v1.14, the last release that still supports C++14) when the system has none |
+
+```bash
+cmake -B build -G Ninja -DLITEMQTT_REQUIRE_TESTS=ON -DLITEMQTT_FETCH_GTEST=ON
+cmake --build build
+ctest --test-dir build --output-on-failure --no-tests=error
+```
+
+## Continuous Integration
+
+`.github/workflows/ci.yml` builds and exercises everything on three platforms:
+
+| Runner | What runs |
+|--------|-----------|
+| `ubuntu-24.04` (x86_64, gcc) | unit tests, the full `reconnect_probe` suite, `reconnect_stress` (flap + weak link) |
+| `windows-latest` (x86_64, MSVC) | unit tests, `reconnect_probe`, `reconnect_stress` (flap) |
+| `ubuntu-24.04-arm` (aarch64, gcc) | unit tests, `reconnect_probe` |
+
+The jobs build with `/W3` (MSVC) or the default gcc warnings, and `ctest` is run
+with `--no-tests=error` so a configuration that silently drops the tests fails
+instead of passing.
 
 ## Running
 

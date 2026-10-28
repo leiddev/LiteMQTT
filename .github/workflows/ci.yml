@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux x86_64: the full job -- unit tests plus both tools.  The probes and the
+  # stress harness drive real sockets on loopback, so this is the job that says
+  # "the reconnect behaviour still works", not just "it compiles".
+  # ---------------------------------------------------------------------------
+  linux-x64:
+    name: Linux x86_64 (gcc)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build libgtest-dev
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLITEMQTT_REQUIRE_TESTS=ON -DLITEMQTT_FETCH_GTEST=ON
+
+      - name: Build
+        run: cmake --build build --parallel 4
+
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+      - name: Reconnect probe suite
+        run: ./build/reconnect_probe all
+
+      - name: Stress harness (flap)
+        run: ./build/reconnect_stress --scenario flap --duration 20
+
+      - name: Stress harness (weak link)
+        run: ./build/reconnect_stress --scenario weak --duration 30
+
+  # ---------------------------------------------------------------------------
+  # Windows x86_64 / MSVC.  Same tests and tools; the resource counters inside
+  # reconnect_stress read /proc and therefore pass trivially here, so the value
+  # of this job is the API, the timers and the socket handling on Winsock.
+  # ---------------------------------------------------------------------------
+  windows-x64:
+    name: Windows x86_64 (MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -A x64 -DLITEMQTT_REQUIRE_TESTS=ON -DLITEMQTT_FETCH_GTEST=ON
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Unit tests
+        run: ctest --test-dir build -C Release --output-on-failure --no-tests=error
+
+      - name: Reconnect probe suite
+        run: .\build\Release\reconnect_probe.exe all
+
+      - name: Stress harness (flap)
+        run: .\build\Release\reconnect_stress.exe --scenario flap --duration 20
+
+  # ---------------------------------------------------------------------------
+  # ARM64 Linux on GitHub's native arm64 runners (public repositories).  Runs
+  # the same unit tests and the probe suite; the stress harness is left out
+  # because its RSS/descriptor accounting is Linux-specific but its timing
+  # windows are tuned for x86 -- the probes already cover the state machine.
+  # ---------------------------------------------------------------------------
+  linux-arm64:
+    name: Linux ARM64 (gcc)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build libgtest-dev
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLITEMQTT_REQUIRE_TESTS=ON -DLITEMQTT_FETCH_GTEST=ON
+
+      - name: Build
+        run: cmake --build build --parallel 4
+
+      - name: Show what we built
+        run: |
+          uname -m
+          ls -l build/reconnect_probe build/reconnect_stress
+
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+      - name: Reconnect probe suite
+        run: ./build/reconnect_probe all
