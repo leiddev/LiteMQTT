@@ -101,6 +101,7 @@ private:
     std::unique_ptr<asio::io_context::work> work_;
     std::shared_ptr<mqtt_client> client_;
     std::thread io_thread_;
+    asio::steady_timer reconnect_timer_;  ///< Backoff timer, never blocks the io thread
 
     std::vector<std::string> pending_topics_;
     std::vector<std::pair<std::string, uint8_t>> subscribes_;
@@ -118,7 +119,8 @@ inline mqtt_helper::mqtt_helper(const std::string& host, uint16_t port,
     : host_(host),
       port_(port),
       client_id_(client_id),
-      should_reconnect_(true) {
+      should_reconnect_(true),
+      reconnect_timer_(io_) {
 }
 
 inline mqtt_helper::~mqtt_helper() {
@@ -201,6 +203,10 @@ inline void mqtt_helper::start() {
 
     user_stopped_.store(false);
     should_reconnect_.store(true);
+    // A fresh start is a fresh session: an attempt counter left over from a
+    // previous run would otherwise make do_reconnect() give up immediately.
+    reconnect_attempts_.store(0);
+    initial_connect_.store(true);
     work_ = std::make_unique<asio::io_context::work>(io_);
 
     init_client();
@@ -212,6 +218,25 @@ inline void mqtt_helper::start() {
 inline void mqtt_helper::stop() {
     user_stopped_.store(true);
     should_reconnect_.store(false);
+    // Cancels a pending backoff wait so that the io thread is not kept alive by
+    // a reconnect that is about to be abandoned anyway.
+    reconnect_timer_.cancel();
+
+    const bool on_io_thread =
+        io_thread_.joinable() && (std::this_thread::get_id() == io_thread_.get_id());
+
+    if (on_io_thread) {
+        // stop() was called from a callback running on the io thread (a natural
+        // thing to do from on_message).  Joining ourselves would throw
+        // "Resource deadlock avoided", so only stop the loop here; the next
+        // stop()/the destructor joins the thread and releases the client.
+        running_.store(false);
+        if (client_) {
+            client_->async_disconnect();
+        }
+        work_.reset();
+        return;
+    }
 
     const bool was_running = running_.exchange(false);
     if (was_running) {
@@ -388,7 +413,12 @@ inline void mqtt_helper::do_reconnect() {
     if (max_reconnect_attempts_ == -1) {
         delay_ms = base_reconnect_delay_ms_;
     } else {
-        delay_ms = std::min(base_reconnect_delay_ms_ * (1 << attempts), 30000);
+        // Cap the shift before it turns into undefined behaviour on long attempt
+        // sequences; the value is clamped to 30 s afterwards anyway.
+        const int shift = std::min(attempts, 20);
+        const long long grown =
+            static_cast<long long>(base_reconnect_delay_ms_) * (1LL << shift);
+        delay_ms = static_cast<int>(std::min<long long>(grown, 30000));
     }
     
     reconnect_attempts_.fetch_add(1);
@@ -397,12 +427,24 @@ inline void mqtt_helper::do_reconnect() {
         << "[mqtt_helper] Reconnecting in " << delay_ms << "ms (attempt " << (attempts + 1) << "/"
         << max_reconnect_attempts_ << ")...";
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
-    if (should_reconnect_.load() && !user_stopped_.load()) {
-        do_connect();
-    }
+    // Wait asynchronously instead of sleeping on the io thread.  A sleep would
+    // freeze reads, writes, ping and timers for the whole backoff window, and
+    // would make stop() block for up to 30 s while joining the thread.
+    std::weak_ptr<mqtt_helper> weak = shared_from_this();
+    reconnect_timer_.expires_after(std::chrono::milliseconds(delay_ms));
+    reconnect_timer_.async_wait([weak](const asio::error_code& ec) {
+        if (ec) {
+            return;  // cancelled by stop()
+        }
+        auto self = weak.lock();
+        if (!self) {
+            return;
+        }
+        if (self->should_reconnect_.load() && !self->user_stopped_.load()) {
+            self->do_connect();
+        }
+    });
 }
-
 }  // namespace litemqtt
 
 #endif  // LITEMQTT_HELPER_HPP
