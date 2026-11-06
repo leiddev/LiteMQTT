@@ -35,8 +35,9 @@ LiteMQTT/
 ├── CMakeLists.txt          # Top-level build file
 ├── main.cc                 # Demo application
 ├── 3rdparty/
-│   ├── asio/               # Vendored standalone Asio
-│   └── asio.cmake          # Asio CMake module
+│   └── asio/               # Vendored standalone Asio; CMakeLists.txt defines the `asio` target
+├── cmake/
+│   └── LiteMQTTConfig.cmake.in  # Package config installed next to LiteMQTTTargets.cmake
 ├── inc/
 │   └── litemqtt/
 │       ├── litemqtt.hpp    # Umbrella header
@@ -62,6 +63,14 @@ LiteMQTT/
 
 ## Build
 
+LiteMQTT is header only, so the build product is the interface target
+`LiteMQTT::litemqtt`. It carries the include directory, C++14, the Windows
+spellings Asio needs and Asio itself, so a consumer only writes
+
+```cmake
+target_link_libraries(my_target PRIVATE LiteMQTT::litemqtt)
+```
+
 Configure with CMake (e.g. with Ninja) and build:
 
 ```bash
@@ -77,13 +86,37 @@ The build produces:
 - `codec_test`, `client_test`, `connection_test`, `helper_test`, `log_test` – unit tests
   (if GoogleTest is available)
 
-GoogleTest is optional so the library and the demo build anywhere. Two options make
-that explicit, which is what CI uses:
+Everything is optional, and everything defaults to ON only when LiteMQTT is the
+top-level project; dropped into another tree with `add_subdirectory`, it becomes
+just the library plus a target the parent can link.
 
-| Option | Effect |
-|--------|--------|
-| `-DLITEMQTT_REQUIRE_TESTS=ON` | fail configure instead of quietly skipping the tests when GoogleTest is missing |
-| `-DLITEMQTT_FETCH_GTEST=ON`   | download googletest (v1.14, the last release that still supports C++14) when the system has none |
+| Option | Default (top-level) | Effect |
+|--------|---------------------|--------|
+| `LITEMQTT_BUILD_EXAMPLES` | ON  | build the demo and the two tools |
+| `LITEMQTT_BUILD_TESTS`    | ON  | build and register the unit tests |
+| `LITEMQTT_INSTALL`        | ON  | generate install / `find_package` rules |
+| `-DLITEMQTT_REQUIRE_TESTS=ON` | OFF | fail configure instead of quietly skipping the tests when GoogleTest is missing |
+| `-DLITEMQTT_FETCH_GTEST=ON`   | OFF | download googletest (v1.14, the last release that still supports C++14) when the system has none |
+
+## Install
+
+```bash
+cmake --install build --prefix /some/prefix
+```
+
+That installs `litemqtt/` under `include/` together with the bundled Asio
+headers, `LiteMQTTTargets.cmake` and `LiteMQTTConfig.cmake` under
+`lib/cmake/LiteMQTT`, and lets a consumer do:
+
+```cmake
+find_package(LiteMQTT 1.0 CONFIG REQUIRED)
+target_link_libraries(my_target PRIVATE LiteMQTT::litemqtt)
+```
+
+If the parent project already provides an `asio` target, that copy is used
+instead of the bundled one and the build-interface include path is not exported.
+
+The configuration CI uses:
 
 ```bash
 cmake -B build -G Ninja -DLITEMQTT_REQUIRE_TESTS=ON -DLITEMQTT_FETCH_GTEST=ON
