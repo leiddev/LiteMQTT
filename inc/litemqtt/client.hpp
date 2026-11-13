@@ -109,6 +109,19 @@ private:
 
 public:
     // Test hooks (do not use in production code).
+
+    /// Overrides the interval the QoS 1/2 retransmit timers wait before sending
+    /// again.  The default is 5 s, which makes the retry path untestable in a
+    /// unit test; a negative value restores the default.
+    void set_retry_interval_for_test(std::chrono::milliseconds interval) {
+        retry_interval_ = (interval.count() < 0) ? kDefaultRetryInterval : interval;
+    }
+
+    /// Number of retransmits a pending QoS 1/2 message gets before it is failed.
+    void set_max_retransmits_for_test(int attempts) {
+        max_retransmits_ = (attempts < 1) ? 3 : attempts;
+    }
+
     uint16_t acquire_packet_id_for_test() { return acquire_packet_id(); }
 
     void debug_insert_pending_publish(uint16_t pid) {
@@ -162,7 +175,9 @@ private:
 
     uint16_t next_packet_id_ = 1;
 
-    static constexpr std::chrono::seconds kPublishRetryInterval{5};
+    static constexpr std::chrono::milliseconds kDefaultRetryInterval{5000};
+    std::chrono::milliseconds retry_interval_ = kDefaultRetryInterval;
+    int max_retransmits_ = 3;
 
     connect_cb on_connect_cb_;
     message_cb on_message_cb_;
@@ -182,6 +197,12 @@ private:
     struct pending_pubrec {
         std::shared_ptr<asio::steady_timer> timer;
         int attempts = 0;
+        // The QoS 2 publish this flow belongs to: it leaves pending_publishes_
+        // at PUBREC, so the completion callback and the give-up path have to
+        // find them here.
+        std::string topic;
+        uint8_t qos = 2;
+        publish_cb callback;
     };
 
     std::map<uint16_t, std::pair<std::vector<std::pair<std::string, uint8_t>>, subscribe_cb>> pending_subscribes_;
@@ -464,27 +485,31 @@ inline void mqtt_client::handle_puback(const std::vector<uint8_t>& data) {
 inline void mqtt_client::handle_pubrec(const std::vector<uint8_t>& data) {
     pubrec_packet pkt = pubrec_packet::parse(data);
 
-    // Check if this is for an outgoing publish (we sent PUBLISH Q2, now got PUBREC)
-    auto pub_it = pending_publishes_.find(pkt.packet_id);
-    if (pub_it != pending_publishes_.end()) {
-        // This is a response to our outgoing QoS 2 publish
-        // Cancel the retry timer and send PUBREL
-        cancel_publish_retry_timer(pkt.packet_id);
-
-        pending_pubrec entry;
-        entry.timer = std::make_shared<asio::steady_timer>(io_);
-        entry.attempts = 0;
-        pending_pubrecs_[pkt.packet_id] = entry;
-
-        send_pubrel(pkt.packet_id);
+    // A duplicate PUBREC for a flow that already moved to PUBREL must not start
+    // a second one: the pending_pubrecs_ entry carries the retry counter, and
+    // resetting it here would make the give-up limit unreachable.
+    auto rec_it = pending_pubrecs_.find(pkt.packet_id);
+    if (rec_it != pending_pubrecs_.end()) {
         return;
     }
 
-    // Check if this is a duplicate PUBREC for a pending_pubrel
-    auto rec_it = pending_pubrecs_.find(pkt.packet_id);
-    if (rec_it != pending_pubrecs_.end()) {
-        // Duplicate PUBREC, ignore
-        return;
+    // Check if this is for an outgoing publish (we sent PUBLISH Q2, now got PUBREC)
+    auto pub_it = pending_publishes_.find(pkt.packet_id);
+    if (pub_it != pending_publishes_.end()) {
+        // This is a response to our outgoing QoS 2 publish: the publish hands
+        // over to the PUBREL half of the flow, so it stops being a pending
+        // publish here and its callback moves with it.
+        cancel_publish_retry_timer(pkt.packet_id);
+        pending_pubrec entry;
+        entry.timer = std::make_shared<asio::steady_timer>(io_);
+        entry.attempts = 0;
+        entry.topic = pub_it->second.topic;
+        entry.qos = pub_it->second.qos;
+        entry.callback = pub_it->second.callback;
+        pending_publishes_.erase(pub_it);
+        pending_pubrecs_[pkt.packet_id] = std::move(entry);
+
+        send_pubrel(pkt.packet_id);
     }
 }
 
@@ -505,10 +530,18 @@ inline void mqtt_client::handle_pubcomp(const std::vector<uint8_t>& data) {
 
     auto rec_it = pending_pubrecs_.find(pkt.packet_id);
     if (rec_it != pending_pubrecs_.end()) {
-        // Cancel the timer and remove from pending
+        std::string topic = rec_it->second.topic;
+        uint8_t qos = rec_it->second.qos;
+        publish_cb cb = rec_it->second.callback;
+
         asio::error_code ec;
         rec_it->second.timer->cancel(ec);
         pending_pubrecs_.erase(rec_it);
+
+        if (cb) {
+            cb(true, topic, qos, pkt.packet_id);
+        }
+        return;
     }
 
     auto pub_it = pending_publishes_.find(pkt.packet_id);
@@ -777,8 +810,6 @@ inline void mqtt_client::send_pubrel(uint16_t packet_id) {
     pubrel_packet pkt;
     pkt.packet_id = packet_id;
 
-    arm_pubrec_retry_timer(packet_id);
-
     auto self = shared_from_this();
     conn_->async_write_packet(pkt.serialize(),
         [this, self, packet_id](const asio::error_code& ec) {
@@ -792,7 +823,9 @@ inline void mqtt_client::send_pubrel(uint16_t packet_id) {
                 }
                 return;
             }
-            // Reset the retry timer
+            // Start the retry window only once the PUBREL is on the wire; arming
+            // it before the write would restart the clock when this completion
+            // runs a moment later.
             arm_pubrec_retry_timer(packet_id);
         });
 }
@@ -802,7 +835,7 @@ inline void mqtt_client::arm_pubrec_retry_timer(uint16_t packet_id) {
     if (rec_it == pending_pubrecs_.end()) return;
 
     auto& timer = rec_it->second.timer;
-    timer->expires_after(std::chrono::seconds(5));
+    timer->expires_after(retry_interval_);
 
     auto self = shared_from_this();
     timer->async_wait([this, self, packet_id](const asio::error_code& ec) {
@@ -812,10 +845,10 @@ inline void mqtt_client::arm_pubrec_retry_timer(uint16_t packet_id) {
         if (rec_it == pending_pubrecs_.end()) return;
 
         pending_pubrec& e = rec_it->second;
-        if (e.attempts >= 3) {
-            // Give up, close connection
-            asio::error_code cancel_ec;
-            e.timer->cancel(cancel_ec);
+        if (e.attempts >= max_retransmits_) {
+            // Give up: notify_closed_once() fails every pending flow, this one
+            // included, and closes the session so the reconnect policy takes
+            // over.  Erasing it here would report the failure twice.
             notify_closed_once();
             return;
         }
@@ -829,7 +862,7 @@ inline void mqtt_client::arm_publish_retry_timer(uint16_t packet_id) {
     if (it == pending_publishes_.end()) return;
 
     auto& timer = it->second.timer;
-    timer->expires_after(std::chrono::seconds(5));
+    timer->expires_after(retry_interval_);
 
     auto self = shared_from_this();
     timer->async_wait([this, self, packet_id](const asio::error_code& ec) {
@@ -841,7 +874,7 @@ inline void mqtt_client::arm_publish_retry_timer(uint16_t packet_id) {
             return;
         }
         pending_publish& e = cur->second;
-        if (e.attempts >= 3) {
+        if (e.attempts >= max_retransmits_) {
             finish_publish_failure(packet_id);
             return;
         }
@@ -912,6 +945,9 @@ inline void mqtt_client::notify_closed_once() {
     pending_publishes_.clear();
 
     for (auto& kv : pending_pubrecs_) {
+        if (kv.second.callback) {
+            kv.second.callback(false, kv.second.topic, kv.second.qos, kv.first);
+        }
         if (kv.second.timer) {
             asio::error_code ec;
             kv.second.timer->cancel(ec);
