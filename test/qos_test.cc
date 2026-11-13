@@ -138,7 +138,10 @@ TEST(ClientQos1, GivesUpAfterMaxRetransmits) {
     EXPECT_EQ(callbacks.load(), 1) << "exactly one terminal callback expected";
     EXPECT_FALSE(last_success.load());
     EXPECT_EQ(harness.client().debug_pending_publish_count(), 0u);
-    EXPECT_GE(closes.load(), 1) << "giving up must close the session";
+    // finish_publish_failure() reports the callback first and then closes the
+    // session, so closes may still be 0 at the instant the callback lands.
+    EXPECT_TRUE(wait_for([&closes]() { return closes.load() >= 1; }, 2000))
+        << "giving up must close the session";
 
     // No further retransmissions once the message was failed.
     const std::size_t after = publishes_received(broker).size();

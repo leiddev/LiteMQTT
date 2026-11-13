@@ -215,6 +215,233 @@ TEST(MqttClientTest, PublishPacketDupClearedByDefault) {
     EXPECT_EQ(data[0] & 0x08, 0x00);
 }
 
+// --- CONNACK handling ------------------------------------------------------
+
+TEST(MqttClientConnack, RefusedSessionReportsTheCodeAndStaysDisconnected) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+    client->set_log_handler([](const litemqtt::log_record&) {});
+
+    bool connect_called = false;
+    bool connect_ok = true;
+    uint8_t connect_rc = 0;
+    int closes = 0;
+    client->on_connect([&](bool ok, uint8_t rc) {
+        connect_called = true;
+        connect_ok = ok;
+        connect_rc = rc;
+    });
+    client->on_close([&closes]() { ++closes; });
+
+    connack_packet refusal;
+    refusal.return_code = 5;  // not authorized
+    client->handle_packet(refusal.serialize());
+
+    EXPECT_TRUE(connect_called);
+    EXPECT_FALSE(connect_ok);
+    EXPECT_EQ(connect_rc, 5);
+    EXPECT_EQ(client->state(), connection_state::disconnected);
+    // The refusal is reported through the connect callback only; the close
+    // notification is suppressed so the reconnect policy is driven from one
+    // place instead of two.
+    EXPECT_EQ(closes, 0) << "a refused CONNACK must not also fire on_close";
+}
+
+TEST(MqttClientConnack, AcceptedSessionMarksConnected) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+    client->set_log_handler([](const litemqtt::log_record&) {});
+
+    bool connect_ok = false;
+    uint8_t connect_rc = 255;
+    client->on_connect([&](bool ok, uint8_t rc) {
+        connect_ok = ok;
+        connect_rc = rc;
+    });
+
+    connack_packet accept;
+    accept.return_code = 0;
+    client->handle_packet(accept.serialize());
+
+    EXPECT_TRUE(connect_ok);
+    EXPECT_EQ(connect_rc, 0);
+    EXPECT_EQ(client->state(), connection_state::connected);
+}
+
+TEST(MqttClientConnack, MalformedConnackClosesTheSession) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+    client->set_log_handler([](const litemqtt::log_record&) {});
+
+    int closes = 0;
+    client->on_close([&closes]() { ++closes; });
+
+    // Declares a 2-byte body but carries none of it.
+    client->handle_packet({0x20, 0x02});
+
+    EXPECT_EQ(closes, 1) << "a malformed CONNACK must close the session";
+}
+
+// --- SUBACK handling -------------------------------------------------------
+
+// A SUBACK that answers fewer filters than the SUBSCRIBE asked for is a
+// protocol error.  It used to be missed when the caller passed no callback,
+// which is exactly what mqtt_helper does when it restores subscriptions after a
+// reconnect.
+TEST(MqttClientSuback, ShortReturnCodesWithNullCallbackStillCloses) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+    client->set_log_handler([](const litemqtt::log_record&) {});
+
+    int closes = 0;
+    client->on_close([&closes]() { ++closes; });
+
+    uint16_t pid = 31;
+    client->debug_insert_pending_subscribe(pid, {{"a", 1}, {"b", 1}, {"c", 1}});
+    client->handle_suback(build_suback_bytes(pid, {0x01, 0x01}));
+
+    EXPECT_EQ(closes, 1) << "the count check must not depend on the callback";
+    EXPECT_EQ(client->debug_pending_subscribe_count(), 0u);
+}
+
+TEST(MqttClientSuback, ShortReturnCodesWithCallbackCloses) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+    client->set_log_handler([](const litemqtt::log_record&) {});
+
+    int closes = 0;
+    int callbacks = 0;
+    client->on_close([&closes]() { ++closes; });
+
+    uint16_t pid = 32;
+    client->debug_insert_pending_subscribe_with_cb(
+        pid, {{"a", 1}, {"b", 1}}, [&callbacks](bool, std::string, uint8_t) { ++callbacks; });
+    client->handle_suback(build_suback_bytes(pid, {0x01}));
+
+    EXPECT_EQ(closes, 1);
+    EXPECT_EQ(callbacks, 0) << "a failed SUBACK must not report per-filter success";
+}
+
+TEST(MqttClientSuback, UnknownPacketIdIsIgnored) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+    client->set_log_handler([](const litemqtt::log_record&) {});
+
+    int closes = 0;
+    client->on_close([&closes]() { ++closes; });
+    client->handle_suback(build_suback_bytes(99, {0x00}));
+    EXPECT_EQ(closes, 0);
+}
+
+// --- subscribe / publish guards --------------------------------------------
+
+// async_publish refuses to run without a session; async_subscribe used to queue
+// the SUBSCRIBE instead, leaving a pending entry behind on a failed connect.
+TEST(MqttClientGuards, SubscribeWithoutSessionIsRejected) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+    client->set_log_handler([](const litemqtt::log_record&) {});
+
+    bool called = false;
+    bool success = true;
+    client->async_subscribe("t", 1, [&](bool ok, std::string, uint8_t) {
+        called = true;
+        success = ok;
+    });
+    io.run();
+
+    EXPECT_TRUE(called);
+    EXPECT_FALSE(success);
+    EXPECT_EQ(client->debug_pending_subscribe_count(), 0u);
+}
+
+TEST(MqttClientGuards, SubscribeRejectsInvalidQos) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+    client->set_log_handler([](const litemqtt::log_record&) {});
+
+    for (uint8_t qos : {3, 4, 255}) {
+        bool called = false;
+        bool success = true;
+        client->async_subscribe("t", qos, [&](bool ok, std::string, uint8_t) {
+            called = true;
+            success = ok;
+        });
+        io.restart();
+        io.run();
+        EXPECT_TRUE(called) << "qos " << static_cast<int>(qos);
+        EXPECT_FALSE(success) << "qos " << static_cast<int>(qos);
+    }
+}
+
+// --- packet id allocation --------------------------------------------------
+
+TEST(MqttClientPacketId, NeverReturnsZero) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+    client->debug_set_next_packet_id(0xFFFE);
+    EXPECT_NE(client->acquire_packet_id_for_test(), 0);
+    EXPECT_NE(client->acquire_packet_id_for_test(), 0);  // wraps past 0
+}
+
+// Exhaustion is the one path that closes the session from inside the allocator.
+TEST(MqttClientPacketId, ExhaustionClosesTheSession) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+    client->set_log_handler([](const litemqtt::log_record&) {});
+
+    // Take one id, then occupy every usable one (1..65535) so the next scan
+    // finds nothing free.
+    const uint16_t first = 5;
+    client->debug_set_next_packet_id(first);
+    const uint16_t taken = client->acquire_packet_id_for_test();
+    ASSERT_EQ(taken, first);
+    for (uint32_t id = 1; id <= 0xFFFF; ++id) {
+        client->debug_insert_pending_publish(static_cast<uint16_t>(id));
+    }
+
+    int closes = 0;
+    client->on_close([&closes]() { ++closes; });
+    EXPECT_EQ(client->acquire_packet_id_for_test(), 0) << "should report exhaustion";
+    EXPECT_EQ(closes, 1) << "exhaustion must close the session exactly once";
+}
+
+// --- inbound PUBLISH -------------------------------------------------------
+
+TEST(MqttClientInbound, InvalidQosIsAProtocolError) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+    client->set_log_handler([](const litemqtt::log_record&) {});
+
+    int messages = 0;
+    int closes = 0;
+    client->on_message([&messages](std::string, std::string, uint8_t, uint16_t) { ++messages; });
+    client->on_close([&closes]() { ++closes; });
+
+    // QoS bits set to 3, which is reserved.
+    client->handle_publish({0x36, 0x04, 0x00, 0x01, 'a', 0x00, 0x01});
+
+    EXPECT_EQ(messages, 0) << "a reserved QoS must not reach the message callback";
+    EXPECT_EQ(closes, 1);
+}
+
+TEST(MqttClientInbound, TruncatedPublishIsAProtocolError) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+    client->set_log_handler([](const litemqtt::log_record&) {});
+
+    int messages = 0;
+    int closes = 0;
+    client->on_message([&messages](std::string, std::string, uint8_t, uint16_t) { ++messages; });
+    client->on_close([&closes]() { ++closes; });
+
+    // Declares a 10-byte body, carries 3.
+    client->handle_publish({0x30, 0x0A, 0x00, 0x01, 'a', 'b', 'c'});
+
+    EXPECT_EQ(messages, 0);
+    EXPECT_EQ(closes, 1);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

@@ -156,6 +156,7 @@ if(LITEMQTT_BUILD_TESTS)
         endfunction()
 
         litemqtt_add_test(codec_test)
+        litemqtt_add_test(robustness_test)
         litemqtt_add_test(client_test)
         litemqtt_add_test(qos_test)
         litemqtt_add_test(log_test)

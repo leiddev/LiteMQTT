@@ -120,3 +120,136 @@ TEST(ConnectionWriteQueue, FailsWritesThatCannotBeSent) {
     EXPECT_EQ(errors.load(), 1);
 }
 
+// --- inbound framing errors -----------------------------------------------
+
+namespace {
+
+/// Drives one connection against a peer that sends @p bytes and reports the
+/// first read result.  Returns true when a result arrived before the timeout.
+struct read_result {
+    bool got = false;
+    bool failed = false;
+    std::string message;
+    std::vector<uint8_t> packet;
+};
+
+read_result read_one(const std::vector<uint8_t>& bytes, std::size_t max_packet = 0) {
+    asio::io_context io;
+    auto conn = std::make_shared<litemqtt::connection>(io);
+    if (max_packet != 0) {
+        conn->set_max_packet_size(max_packet);
+    }
+
+    // A peer on loopback that accepts and writes the bytes, then holds the link
+    // open until the client closes it (join happens after conn->close()).
+    asio::ip::tcp::acceptor acc(io, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), 0));
+    const uint16_t port = acc.local_endpoint().port();
+    asio::ip::tcp::socket peer(io);
+    std::thread writer([&]() {
+        asio::error_code ec;
+        acc.accept(peer, ec);
+        if (ec) {
+            return;
+        }
+        asio::write(peer, asio::buffer(bytes), ec);
+        char drain[64];
+        while (!ec) {
+            peer.read_some(asio::buffer(drain), ec);
+        }
+        peer.close(ec);
+    });
+
+    read_result result;
+    conn->async_connect("127.0.0.1", port, [&](const asio::error_code& ec) {
+        if (ec) {
+            result.got = true;
+            result.failed = true;
+            result.message = ec.message();
+            return;
+        }
+        conn->mark_connected();
+        conn->async_read_packet([&](const asio::error_code& rec, const std::vector<uint8_t>& pkt) {
+            result.got = true;
+            result.failed = static_cast<bool>(rec);
+            result.message = rec.message();
+            result.packet = pkt;
+        });
+    });
+
+    for (int i = 0; i < 400 && !result.got; ++i) {
+        io.run_one();
+        if (io.stopped()) {
+            io.restart();
+        }
+    }
+
+    conn->close();
+    io.restart();
+    io.run();  // let the close handlers drain
+    writer.join();
+    return result;
+}
+
+}  // namespace
+
+TEST(ConnectionFramingErrors, ZeroLengthPacketIsDelivered) {
+    const auto r = read_one({0xC0, 0x00});
+    ASSERT_TRUE(r.got) << "no read result";
+    EXPECT_FALSE(r.failed) << r.message;
+    EXPECT_EQ(r.packet, (std::vector<uint8_t>{0xC0, 0x00}));
+}
+
+TEST(ConnectionFramingErrors, ReservedPacketTypeZeroIsRejected) {
+    const auto r = read_one({0x00, 0x00});
+    ASSERT_TRUE(r.got) << "no read result";
+    EXPECT_TRUE(r.failed) << "packet type 0 is reserved and must be rejected";
+}
+
+TEST(ConnectionFramingErrors, ReservedPacketTypeFifteenIsRejected) {
+    const auto r = read_one({0xF0, 0x00});
+    ASSERT_TRUE(r.got) << "no read result";
+    EXPECT_TRUE(r.failed) << "packet type 15 is reserved and must be rejected";
+}
+
+TEST(ConnectionFramingErrors, RemainingLengthOverFourBytesIsRejected) {
+    // Five length bytes, all continuation: not a legal encoding.
+    const auto r = read_one({0x30, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F});
+    ASSERT_TRUE(r.got) << "no read result";
+    EXPECT_TRUE(r.failed) << "a five-byte remaining length must be rejected";
+}
+
+// The length field is chosen by the peer, and the body buffer is allocated at
+// its full size.  Without a cap a four-byte length of 268435455 allocates
+// 256 MiB before any payload arrives.
+TEST(ConnectionFramingErrors, OversizedPacketIsRejectedBeforeAllocating) {
+    // PINGREQ type, but a declared body far above the default 1 MiB cap.
+    const auto r = read_one({0xC0, 0xFF, 0xFF, 0x7F});
+    ASSERT_TRUE(r.got) << "no read result";
+    EXPECT_TRUE(r.failed) << "an oversized remaining length must be rejected";
+}
+
+TEST(ConnectionFramingErrors, PacketBelowTheCapIsAccepted) {
+    // 8-byte body, comfortably under the default cap.
+    std::vector<uint8_t> frame = {0x30, 0x08};
+    frame.insert(frame.end(), 8, 'x');
+    const auto r = read_one(frame);
+    ASSERT_TRUE(r.got) << "no read result";
+    EXPECT_FALSE(r.failed) << r.message;
+    EXPECT_EQ(r.packet.size(), frame.size());
+}
+
+TEST(ConnectionFramingErrors, CapIsConfigurable) {
+    std::vector<uint8_t> frame = {0x30, 0x08};
+    frame.insert(frame.end(), 8, 'x');
+
+    // A 4-byte cap rejects what the default accepts...
+    const auto rejected = read_one(frame, 4);
+    ASSERT_TRUE(rejected.got);
+    EXPECT_TRUE(rejected.failed) << "a body above the configured cap must be rejected";
+
+    // ... and a generous cap accepts it.
+    const auto accepted = read_one(frame, 1024);
+    ASSERT_TRUE(accepted.got);
+    EXPECT_FALSE(accepted.failed) << accepted.message;
+}
+

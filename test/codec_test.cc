@@ -204,7 +204,9 @@ TEST(ConnectPacketTest, Parse) {
     pkt.clean_session = true;
 
     std::vector<uint8_t> data = pkt.serialize();
-    connect_packet parsed = connect_packet::parse(data);
+    connect_packet parsed;
+
+    ASSERT_TRUE(connect_packet::parse(data, parsed)) << "parse failed";
 
     EXPECT_EQ(parsed.client_id, "test_client");
     EXPECT_EQ(parsed.keep_alive_seconds, 60);
@@ -223,7 +225,10 @@ TEST(ConnackPacketTest, SerializeAndParse) {
     EXPECT_EQ(data[2], 0x00);
     EXPECT_EQ(data[3], 0x00);
 
-    connack_packet parsed = connack_packet::parse(data);
+    connack_packet parsed;
+
+
+    ASSERT_TRUE(connack_packet::parse(data, parsed)) << "parse failed";
     EXPECT_EQ(parsed.session_present, 0);
     EXPECT_EQ(parsed.return_code, 0);
 }
@@ -238,7 +243,10 @@ TEST(PublishPacketTest, SerializeAndParse) {
     std::vector<uint8_t> data = pkt.serialize();
     EXPECT_GE(data.size(), 16);
 
-    publish_packet parsed = publish_packet::parse(data);
+    publish_packet parsed;
+
+
+    ASSERT_TRUE(publish_packet::parse(data, parsed)) << "parse failed";
     EXPECT_EQ(parsed.packet_id, 1);
     EXPECT_EQ(parsed.qos, 1);
     EXPECT_EQ(parsed.topic_name, "test/topic");
@@ -254,7 +262,10 @@ TEST(PublishPacketTest, QoS0NoPacketId) {
     std::vector<uint8_t> data = pkt.serialize();
     EXPECT_GE(data.size(), 7);
 
-    publish_packet parsed = publish_packet::parse(data);
+    publish_packet parsed;
+
+
+    ASSERT_TRUE(publish_packet::parse(data, parsed)) << "parse failed";
     EXPECT_EQ(parsed.qos, 0);
     EXPECT_EQ(parsed.topic_name, "test/topic");
     EXPECT_EQ(parsed.payload, "Hello");
@@ -271,7 +282,10 @@ TEST(PublishPacketTest, DupBitRoundtrip) {
     std::vector<uint8_t> data = pkt.serialize();
     EXPECT_NE(data.empty(), true);
 
-    publish_packet parsed = publish_packet::parse(data);
+    publish_packet parsed;
+
+
+    ASSERT_TRUE(publish_packet::parse(data, parsed)) << "parse failed";
     EXPECT_TRUE(parsed.dup);
     EXPECT_EQ(parsed.qos, 1);
     EXPECT_EQ(parsed.packet_id, 7);
@@ -285,7 +299,9 @@ TEST(PublishPacketTest, DupBitClearedByDefault) {
     pkt.payload = "first";
 
     std::vector<uint8_t> data = pkt.serialize();
-    publish_packet parsed = publish_packet::parse(data);
+    publish_packet parsed;
+
+    ASSERT_TRUE(publish_packet::parse(data, parsed)) << "parse failed";
     EXPECT_FALSE(parsed.dup);
 }
 
@@ -308,6 +324,7 @@ TEST(PingreqPacketTest, SerializeAndParse) {
     EXPECT_EQ(data[1], 0x00);
 
     pingreq_packet parsed = pingreq_packet::parse(data);
+    (void)parsed;
 }
 
 TEST(PingrespPacketTest, SerializeAndParse) {
@@ -319,6 +336,7 @@ TEST(PingrespPacketTest, SerializeAndParse) {
     EXPECT_EQ(data[1], 0x00);
 
     pingresp_packet parsed = pingresp_packet::parse(data);
+    (void)parsed;
 }
 
 TEST(DisconnectPacketTest, SerializeAndParse) {
@@ -330,6 +348,78 @@ TEST(DisconnectPacketTest, SerializeAndParse) {
     EXPECT_EQ(data[1], 0x00);
 
     disconnect_packet parsed = disconnect_packet::parse(data);
+    (void)parsed;
+}
+
+// --- encoder boundaries ----------------------------------------------------
+
+// A 16-bit length prefix cannot describe more than 65535 bytes.  Truncating the
+// prefix would produce a frame whose contents disagree with their own length,
+// so the writer rejects it instead.
+TEST(EncoderBoundary, WriteStringRejectsTooLong) {
+    std::vector<uint8_t> buf;
+    buffer_writer writer(buf);
+    EXPECT_THROW(writer.write_string(std::string(65536, 'x')), std::length_error);
+    EXPECT_TRUE(buf.empty()) << "nothing may be written before the throw";
+
+    // The largest legal value still works.
+    EXPECT_NO_THROW(writer.write_string(std::string(65535, 'x')));
+    EXPECT_EQ(buf.size(), 2u + 65535u);
+    EXPECT_EQ(buf[0], 0xFF);
+    EXPECT_EQ(buf[1], 0xFF);
+}
+
+// Four length bytes cover 268435455; a fifth is not a legal encoding, so the
+// writer refuses to emit one.
+TEST(EncoderBoundary, WriteRemainingLengthRejectsTooLarge) {
+    std::vector<uint8_t> buf;
+    buffer_writer writer(buf);
+    EXPECT_THROW(writer.write_remaining_length(268435456), std::length_error);
+    EXPECT_TRUE(buf.empty());
+
+    EXPECT_NO_THROW(writer.write_remaining_length(buffer_writer::kMaxRemainingLength));
+    EXPECT_EQ(buf.size(), 4u);
+    const std::vector<uint8_t> expected = {0xFF, 0xFF, 0xFF, 0x7F};
+    EXPECT_EQ(buf, expected);
+}
+
+// serialize() routes everything through the writer, so an oversized topic or
+// payload surfaces as the same exception rather than a corrupt frame.
+TEST(EncoderBoundary, PublishWithOversizedTopicThrows) {
+    publish_packet pkt;
+    pkt.qos = 0;
+    pkt.topic_name = std::string(65536, 't');
+    EXPECT_THROW(pkt.serialize(), std::length_error);
+}
+
+TEST(EncoderBoundary, ConnectWithOversizedClientIdThrows) {
+    connect_packet pkt;
+    pkt.client_id = std::string(65536, 'c');
+    EXPECT_THROW(pkt.serialize(), std::length_error);
+}
+
+// CONNECT flag layout: clean session 0x02, username 0x80, password 0x40.
+TEST(ConnectPacketTest, FlagsForUsernameAndPassword) {
+    connect_packet pkt;
+    pkt.client_id = "c";
+    pkt.clean_session = true;
+    pkt.username = "user";
+    pkt.password = "pass";
+
+    std::vector<uint8_t> data = pkt.serialize();
+    ASSERT_EQ(data[0], 0x10);
+    // Fixed header is 2 bytes, then "MQTT" (2+4), level, flags.
+    EXPECT_EQ(data[2 + 6], MQTT_PROTOCOL_LEVEL);
+    EXPECT_EQ(data[2 + 7], 0xC2) << "clean session + username + password";
+}
+
+TEST(ConnectPacketTest, FlagsForUsernameOnly) {
+    connect_packet pkt;
+    pkt.client_id = "c";
+    pkt.username = "user";
+
+    std::vector<uint8_t> data = pkt.serialize();
+    EXPECT_EQ(data[2 + 7], 0x80) << "username only, no clean session";
 }
 
 }  // namespace

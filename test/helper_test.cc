@@ -1,9 +1,12 @@
-// Tests for the lifetime / reconnect behaviour of mqtt_helper.  None of them
-// needs a broker: a refused connect is enough to exercise the reconnect path.
+// Tests for the lifetime, reconnect and connect/keepalive behaviour of
+// mqtt_helper.  The lifetime and backoff cases need no broker -- a refused
+// connect is enough -- while the connect, keepalive and publish-before-start
+// cases use the scripted loopback peer.
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -12,24 +15,16 @@
 #include <vector>
 
 #include "litemqtt/mqtt_helper.hpp"
+#include "loopback_broker.hpp"
 
 namespace {
 
 using namespace std::chrono;
+using litemqtt_test::loopback_broker;
+using litemqtt_test::wait_for;
 
 /// Port 1 has no listener, so every connect attempt is refused immediately.
 constexpr uint16_t kRefusedPort = 1;
-
-bool wait_for(const std::function<bool()>& pred, int timeout_ms) {
-    const auto deadline = steady_clock::now() + milliseconds(timeout_ms);
-    while (steady_clock::now() < deadline) {
-        if (pred()) {
-            return true;
-        }
-        std::this_thread::sleep_for(milliseconds(5));
-    }
-    return pred();
-}
 
 std::shared_ptr<litemqtt::mqtt_helper> make_helper(const std::string& id) {
     auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", kRefusedPort, id);
@@ -228,4 +223,169 @@ TEST(MqttHelperReconnect, UnlimitedWaitsAFixedInterval) {
         EXPECT_LT(gap, 300) << "gap before retry " << (i + 1) << " grew to " << gap
                             << " ms; unlimited mode must use a constant delay";
     }
+}
+
+// --- operations without a session ------------------------------------------
+
+// Between stop() and start() there is no client to hand the message to.  A
+// publisher loop waiting for the callback would stall for good if the failure
+// were not reported.
+TEST(MqttHelperOperations, PublishAfterStopReportsFailure) {
+    auto helper = make_helper("publish-after-stop");
+    helper->set_reconnect_config(0, 10);
+    helper->start();
+    std::this_thread::sleep_for(milliseconds(100));
+    helper->stop();
+
+    std::atomic<bool> called{false};
+    std::atomic<bool> success{true};
+    std::atomic<uint16_t> packet_id{1};
+    helper->publish("t", "p", 0,
+                    [&called, &success, &packet_id](bool ok, std::string, uint8_t, uint16_t id) {
+                        called = true;
+                        success = ok;
+                        packet_id = id;
+                    });
+
+    EXPECT_TRUE(wait_for([&called]() { return called.load(); }, 2000))
+        << "the publish callback never ran, a waiting caller would hang";
+    EXPECT_FALSE(success.load());
+    EXPECT_EQ(packet_id.load(), 0);
+}
+
+// subscribe() before start() must not crash and must not fire a callback that
+// can never be answered; the topic is recorded and carried out on connect.
+TEST(MqttHelperOperations, SubscribeWithoutClientIsANoOp) {
+    auto helper = make_helper("subscribe-no-client");
+    std::atomic<int> callbacks{0};
+    EXPECT_NO_THROW(
+        helper->subscribe("t", 1, [&callbacks](bool, std::string, uint8_t) { ++callbacks; }));
+    std::this_thread::sleep_for(milliseconds(50));
+    EXPECT_EQ(callbacks.load(), 0);
+    EXPECT_FALSE(helper->is_connected());
+}
+
+// --- backoff growth and its ceiling ---------------------------------------
+
+// The ceiling is what keeps a long outage from pushing the retry out to
+// minutes; it has to be configurable so this can be checked without waiting
+// 30 seconds.
+TEST(MqttHelperReconnect, BackoffStopsGrowingAtTheConfiguredCeiling) {
+    auto helper = make_helper("backoff-cap");
+    std::mutex mutex;
+    std::vector<std::pair<int, long long>> attempts;  // (delay_ms, stamp)
+    const auto t0 = steady_clock::now();
+    helper->set_log_handler([&](const litemqtt::log_record& r) {
+        const std::string marker = "Reconnecting in ";
+        const auto at = r.message.find(marker);
+        if (at == std::string::npos) {
+            return;
+        }
+        const int delay = std::atoi(r.message.c_str() + at + marker.size());
+        std::lock_guard<std::mutex> lock(mutex);
+        attempts.emplace_back(delay, duration_cast<milliseconds>(steady_clock::now() - t0).count());
+    });
+    // base 20 ms: 20, 40, 80, 160 ... capped at 100.
+    helper->set_reconnect_config(8, 20);
+    helper->set_max_reconnect_delay(100);
+    helper->start();
+
+    ASSERT_TRUE(wait_for([&mutex, &attempts]() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return attempts.size() >= 5;  // 20, 40, 80, 100, 100
+    }, 3000));
+    helper->stop();
+
+    std::lock_guard<std::mutex> lock(mutex);
+    ASSERT_GE(attempts.size(), 5u);
+    // base * 2^attempt, clamped to the ceiling: 20, 40, 80, then 160 -> 100 and
+    // everything after it stays there.
+    EXPECT_EQ(attempts[0].first, 20);
+    EXPECT_EQ(attempts[1].first, 40);
+    EXPECT_EQ(attempts[2].first, 80);
+    for (std::size_t i = 3; i < attempts.size(); ++i) {
+        EXPECT_EQ(attempts[i].first, 100)
+            << "attempt " << (i + 1) << " ran at " << attempts[i].first
+            << " ms instead of the 100 ms ceiling";
+    }
+}
+
+// --- connect timeout -------------------------------------------------------
+
+// A peer that accepts the socket and then says nothing never completes the
+// handshake; without the timeout the session would sit in "handshaking" for as
+// long as the keepalive allows.
+TEST(MqttHelperConnect, TimeoutReportsFailureOnce) {
+    loopback_broker broker;
+    broker.set_handshake(loopback_broker::handshake::silent);
+
+    auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", broker.port(), "timeout");
+    std::atomic<int> failures{0};
+    std::atomic<int> successes{0};
+    helper->set_log_handler([&failures, &successes](const litemqtt::log_record& r) {
+        if (r.message.find("Connect timed out") != std::string::npos) {
+            ++failures;
+        }
+        if (r.message.find("Connected to broker") != std::string::npos) {
+            ++successes;
+        }
+    });
+    helper->set_connect_timeout(150);
+    helper->set_reconnect_config(0, 10);  // one attempt, no retry
+    helper->start();
+
+    ASSERT_TRUE(wait_for([&failures]() { return failures.load() >= 1; }, 3000))
+        << "the connect attempt was never abandoned";
+    EXPECT_EQ(successes.load(), 0);
+    EXPECT_FALSE(helper->is_connected());
+    helper->stop();
+}
+
+// --- keepalive -------------------------------------------------------------
+
+// keep_alive == 0 disables the keepalive entirely: no PINGREQ is sent.
+TEST(MqttHelperKeepAlive, ZeroSendsNoPing) {
+    loopback_broker broker;
+    auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", broker.port(), "ka-zero");
+    helper->set_log_handler([](const litemqtt::log_record&) {});
+    helper->set_keep_alive(0);
+    helper->set_reconnect_config(0, 10);
+    helper->start();
+
+    ASSERT_TRUE(wait_for([&helper]() { return helper->is_connected(); }, 3000));
+    std::this_thread::sleep_for(milliseconds(700));
+    helper->stop();
+
+    int pings = 0;
+    for (const auto& frame : broker.received()) {
+        if (!frame.empty() && (frame[0] >> 4) == 12) {
+            ++pings;
+        }
+    }
+    EXPECT_EQ(pings, 0) << "keep_alive 0 must not send PINGREQ";
+}
+
+// A broker that never answers PINGRESP must be detected and the session
+// dropped: 1.5 x keep_alive is the only thing that notices a half-dead link.
+TEST(MqttHelperKeepAlive, MissingPingrespClosesTheSession) {
+    loopback_broker broker;  // never replies to anything after CONNACK
+
+    auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", broker.port(), "ka-dead");
+    std::atomic<int> closes{0};
+    helper->set_log_handler(
+        [&closes](const litemqtt::log_record& r) {
+            if (r.message.find("Connection closed") != std::string::npos) {
+                ++closes;
+            }
+        });
+    helper->set_keep_alive(1);
+    helper->set_reconnect_config(0, 10);
+    helper->start();
+
+    ASSERT_TRUE(wait_for([&helper]() { return helper->is_connected(); }, 3000));
+    // PINGREQ goes out after 1 s; the 0.5 s wait for PINGRESP then expires.
+    EXPECT_TRUE(wait_for([&closes]() { return closes.load() >= 1; }, 4000))
+        << "a missing PINGRESP never closed the session";
+    EXPECT_FALSE(helper->is_connected());
+    helper->stop();
 }
