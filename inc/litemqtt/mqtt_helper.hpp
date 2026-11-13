@@ -51,10 +51,17 @@ public:
     ///                       (no exponential growth)
     ///   max_attempts >= 0   give up after that many consecutive failures, the
     ///                       delay growing as base_delay_ms * 2^attempt, capped
-    ///                       at 30 s; a successful connect resets the counter
+    ///                       at the value set by set_max_reconnect_delay()
+    ///                       (30 s by default); a successful connect resets the
+    ///                       counter
     /// After giving up, call rearm_reconnect() (or stop() + start()).
     /// A negative base_delay_ms is treated as 0.
     void set_reconnect_config(int max_attempts, int base_delay_ms);
+
+    /// Upper bound for the exponential backoff, in milliseconds.  Defaults to
+    /// 30 s; 0 or a negative value restores it.  Only used when
+    /// set_reconnect_config() was given a non-negative max_attempts.
+    void set_max_reconnect_delay(int ms);
 
     // Core operations
     void on_message(message_callback callback);
@@ -102,6 +109,8 @@ public:
     bool has_log_handler() const { return log_channel_.has_handler(); }
 
 private:
+    static constexpr int kDefaultMaxReconnectDelayMs = 30000;
+
     void init_client();
     void start_io_thread();
     void release_client();
@@ -124,6 +133,7 @@ private:
 
     int max_reconnect_attempts_ = 10;
     int base_reconnect_delay_ms_ = 1000;
+    int max_reconnect_delay_ms_ = kDefaultMaxReconnectDelayMs;
     std::atomic<int> reconnect_attempts_{0};
     std::atomic<bool> initial_connect_{true};
 
@@ -190,6 +200,10 @@ inline void mqtt_helper::set_reconnect_config(int max_attempts,
     // (give up on the first failure, which is a legal configuration).
     max_reconnect_attempts_ = (max_attempts < -1) ? 0 : max_attempts;
     base_reconnect_delay_ms_ = (base_delay_ms < 0) ? 0 : base_delay_ms;
+}
+
+inline void mqtt_helper::set_max_reconnect_delay(int ms) {
+    max_reconnect_delay_ms_ = (ms <= 0) ? kDefaultMaxReconnectDelayMs : ms;
 }
 
 inline void mqtt_helper::set_log_handler(log_handler handler) {
@@ -595,11 +609,12 @@ inline void mqtt_helper::do_reconnect() {
         delay_ms = base_reconnect_delay_ms_;
     } else {
         // Cap the shift before it turns into undefined behaviour on long attempt
-        // sequences; the value is clamped to 30 s afterwards anyway.
+        // sequences; the value is clamped to the configured maximum afterwards
+        // anyway.
         const int shift = std::min(attempts, 20);
         const long long grown =
             static_cast<long long>(base_reconnect_delay_ms_) * (1LL << shift);
-        delay_ms = static_cast<int>(std::min<long long>(grown, 30000));
+        delay_ms = static_cast<int>(std::min<long long>(grown, max_reconnect_delay_ms_));
     }
     
     // Saturate rather than overflow: with max_attempts == -1 a helper that keeps

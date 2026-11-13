@@ -124,6 +124,10 @@ public:
 
     uint16_t acquire_packet_id_for_test() { return acquire_packet_id(); }
 
+    /// Points the allocator at @p id, so a test can walk it into exhaustion
+    /// without filling 65535 pending entries first.
+    void debug_set_next_packet_id(uint16_t id) { next_packet_id_ = id; }
+
     void debug_insert_pending_publish(uint16_t pid) {
         pending_publish entry;
         entry.topic = "test/topic";
@@ -390,7 +394,13 @@ inline void mqtt_client::handle_connack(const std::vector<uint8_t>& data) {
         connect_timer_->cancel(ignored);
     }
 
-    connack_packet pkt = connack_packet::parse(data);
+    connack_packet pkt;
+    if (!connack_packet::parse(data, pkt)) {
+        LITEMQTT_LOG_TO(log_channel_, log_level::error)
+            << "Protocol error: malformed CONNACK";
+        notify_closed_once();
+        return;
+    }
     if (pkt.return_code == 0) {
         conn_->mark_connected();
         closed_ = false;
@@ -407,11 +417,11 @@ inline void mqtt_client::handle_connack(const std::vector<uint8_t>& data) {
 }
 
 inline void mqtt_client::handle_publish(const std::vector<uint8_t>& data) {
-    publish_packet pkt = publish_packet::parse(data);
-
-    if (pkt.qos > 2) {
+    publish_packet pkt;
+    // parse() already rejects a QoS of 3, so no range check is needed here.
+    if (!publish_packet::parse(data, pkt)) {
         LITEMQTT_LOG_TO(log_channel_, log_level::error)
-            << "Protocol error: PUBLISH with invalid QoS " << static_cast<int>(pkt.qos);
+            << "Protocol error: malformed PUBLISH";
         notify_closed_once();
         return;
     }
@@ -437,7 +447,13 @@ inline void mqtt_client::handle_publish(const std::vector<uint8_t>& data) {
 }
 
 inline void mqtt_client::handle_suback(const std::vector<uint8_t>& data) {
-    suback_packet pkt = suback_packet::parse(data);
+    suback_packet pkt;
+    if (!suback_packet::parse(data, pkt)) {
+        LITEMQTT_LOG_TO(log_channel_, log_level::error)
+            << "Protocol error: malformed SUBACK";
+        notify_closed_once();
+        return;
+    }
     auto it = pending_subscribes_.find(pkt.packet_id);
     if (it == pending_subscribes_.end()) {
         return;
@@ -448,12 +464,17 @@ inline void mqtt_client::handle_suback(const std::vector<uint8_t>& data) {
     std::vector<std::pair<std::string, uint8_t>> filters{filters_ref};
     pending_subscribes_.erase(it);
 
-    if (!cb) {
+    // The count check comes before the callback check: a SUBACK that answers
+    // fewer filters than the SUBSCRIBE asked for is a protocol error whether or
+    // not the caller wanted to be told about it.  mqtt_helper restores
+    // subscriptions with a null callback, so the other order silently dropped
+    // the error on every reconnect.
+    if (pkt.return_codes.size() < filters.size()) {
+        notify_closed_once();
         return;
     }
 
-    if (pkt.return_codes.size() < filters.size()) {
-        notify_closed_once();
+    if (!cb) {
         return;
     }
 
@@ -466,7 +487,13 @@ inline void mqtt_client::handle_suback(const std::vector<uint8_t>& data) {
 }
 
 inline void mqtt_client::handle_puback(const std::vector<uint8_t>& data) {
-    puback_packet pkt = puback_packet::parse(data);
+    puback_packet pkt;
+    if (!puback_packet::parse(data, pkt)) {
+        LITEMQTT_LOG_TO(log_channel_, log_level::error)
+            << "Protocol error: malformed PUBACK";
+        notify_closed_once();
+        return;
+    }
     auto it = pending_publishes_.find(pkt.packet_id);
     if (it == pending_publishes_.end()) {
         return;
@@ -483,7 +510,13 @@ inline void mqtt_client::handle_puback(const std::vector<uint8_t>& data) {
 }
 
 inline void mqtt_client::handle_pubrec(const std::vector<uint8_t>& data) {
-    pubrec_packet pkt = pubrec_packet::parse(data);
+    pubrec_packet pkt;
+    if (!pubrec_packet::parse(data, pkt)) {
+        LITEMQTT_LOG_TO(log_channel_, log_level::error)
+            << "Protocol error: malformed PUBREC";
+        notify_closed_once();
+        return;
+    }
 
     // A duplicate PUBREC for a flow that already moved to PUBREL must not start
     // a second one: the pending_pubrecs_ entry carries the retry counter, and
@@ -514,7 +547,13 @@ inline void mqtt_client::handle_pubrec(const std::vector<uint8_t>& data) {
 }
 
 inline void mqtt_client::handle_pubrel(const std::vector<uint8_t>& data) {
-    pubrel_packet pkt = pubrel_packet::parse(data);
+    pubrel_packet pkt;
+    if (!pubrel_packet::parse(data, pkt)) {
+        LITEMQTT_LOG_TO(log_channel_, log_level::error)
+            << "Protocol error: malformed PUBREL";
+        notify_closed_once();
+        return;
+    }
 
     // Send PUBCOMP to complete the QoS 2 incoming flow
     pubcomp_packet pubcomp;
@@ -526,7 +565,13 @@ inline void mqtt_client::handle_pubrel(const std::vector<uint8_t>& data) {
 }
 
 inline void mqtt_client::handle_pubcomp(const std::vector<uint8_t>& data) {
-    pubcomp_packet pkt = pubcomp_packet::parse(data);
+    pubcomp_packet pkt;
+    if (!pubcomp_packet::parse(data, pkt)) {
+        LITEMQTT_LOG_TO(log_channel_, log_level::error)
+            << "Protocol error: malformed PUBCOMP";
+        notify_closed_once();
+        return;
+    }
 
     auto rec_it = pending_pubrecs_.find(pkt.packet_id);
     if (rec_it != pending_pubrecs_.end()) {
@@ -704,6 +749,15 @@ inline void mqtt_client::async_subscribe_impl(const std::string& topic, uint8_t 
         return;
     }
 
+    if (conn_->state() != connection_state::connected) {
+        // Same rule as async_publish(): without an established session there is
+        // nothing to subscribe on.  Queuing the SUBSCRIBE here used to leave a
+        // pending_subscribes_ entry behind on a connect attempt that then
+        // failed, which nothing reported.
+        if (callback) callback(false, topic, 0);
+        return;
+    }
+
     uint16_t packet_id = acquire_packet_id();
     if (packet_id == 0) {
         // All packet IDs exhausted
@@ -751,26 +805,32 @@ inline connection_state mqtt_client::state() const { return conn_->state(); }
 // Returns 0 if all packet IDs are exhausted (all 65535 IDs are in use).
 // async_publish / async_subscribe enforce this via asio::post.
 inline uint16_t mqtt_client::acquire_packet_id() {
-    uint16_t start = next_packet_id_;
-    for (;;) {
-        ++next_packet_id_;
-        if (next_packet_id_ == 0) {
-            ++next_packet_id_;  // Skip reserved value 0
+    // The usable ids are 1..65535, so the search is bounded by how many of them
+    // have been probed.  Comparing the cursor against its starting value looks
+    // equivalent but is not: next_packet_id_ already points *past* the last id
+    // handed out, so the walk wrapped around and returned an id nobody had
+    // claimed yet instead of reporting exhaustion.
+    for (unsigned probed = 0; probed < 65535; ++probed) {
+        uint16_t candidate = next_packet_id_;
+        if (candidate == 0) {
+            candidate = 1;  // 0 is reserved
         }
-        if (next_packet_id_ == start) {
-            // All packet IDs exhausted, trigger connection close
-            LITEMQTT_LOG_TO(log_channel_, log_level::error)
-                << "acquire_packet_id: all packet IDs exhausted";
-            notify_closed_once();
-            return 0;
-        }
-        if (!pending_publishes_.count(next_packet_id_) &&
-            !pending_subscribes_.count(next_packet_id_) &&
-            !pending_pubrecs_.count(next_packet_id_)) {
-            return next_packet_id_;
+        next_packet_id_ = (candidate == 0xFFFF) ? 1 : static_cast<uint16_t>(candidate + 1);
+
+        if (!pending_publishes_.count(candidate) &&
+            !pending_subscribes_.count(candidate) &&
+            !pending_pubrecs_.count(candidate)) {
+            return candidate;
         }
     }
+
+    // Every id is in use: this session cannot make progress any more.
+    LITEMQTT_LOG_TO(log_channel_, log_level::error)
+        << "acquire_packet_id: all packet IDs exhausted";
+    notify_closed_once();
+    return 0;
 }
+
 
 inline void mqtt_client::send_publish_entry(uint16_t packet_id) {
     auto it = pending_publishes_.find(packet_id);

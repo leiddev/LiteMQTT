@@ -53,6 +53,15 @@ public:
         close_handler_ = std::move(handler);
     }
 
+    /// Largest body this connection will read.  A PUBLISH larger than this is
+    /// reported as asio::error::message_size instead of being buffered.  The
+    /// default leaves room for a 1 MiB payload; MQTT itself allows up to
+    /// 268435455, so raise it if the application really exchanges larger
+    /// messages.  0 disables the check.
+    void set_max_packet_size(std::size_t bytes) { max_packet_size_ = bytes; }
+
+    std::size_t max_packet_size() const { return max_packet_size_; }
+
     connection_state state() const {
         return state_.load();
     }
@@ -98,6 +107,9 @@ private:
     int reading_depth_ = 0;
 
     close_handler close_handler_;
+
+    /// Guard against a peer asking for a huge allocation (see read_packet_body).
+    std::size_t max_packet_size_ = 1024 * 1024;
 
     // Write queue: only touched from the io thread (async_write_packet() posts
     // the enqueue), which keeps it lock free.
@@ -194,6 +206,16 @@ inline void connection::read_remaining_length_step(read_handler handler,
     // destroyed std::function for any packet whose length needs 3+ bytes.
     // Passing the shared state down the (non-growing) recursion keeps it alive
     // for exactly as long as the async operation needs it.
+
+    // A remaining length is at most four bytes.  The bound has to be checked
+    // before the next byte is read, not after: byte_buffer holds exactly four,
+    // so a fifth continuation byte addressed byte_buffer[4], one past the end.
+    if (st->bytes_read >= 4) {
+        reading_depth_ = 0;
+        io_.post([handler]() { handler(asio::error::make_error_code(asio::error::message_size), {}); });
+        return;
+    }
+
     auto self = shared_from_this();
     asio::async_read(socket_,
         asio::buffer(st->byte_buffer.data() + st->bytes_read, 1),
@@ -209,12 +231,6 @@ inline void connection::read_remaining_length_step(read_handler handler,
             st->remaining_length += (b & 0x7F) * st->multiplier;
             st->multiplier *= 128;
 
-            if (st->bytes_read > 4) {
-                reading_depth_ = 0;
-                io_.post([handler]() { handler(asio::error::make_error_code(asio::error::message_size), {}); });
-                return;
-            }
-
             // Keep this length byte: the parser re-reads the fixed header, so the
             // packet handed over must contain all of it.
             read_header_.push_back(b);
@@ -228,6 +244,17 @@ inline void connection::read_remaining_length_step(read_handler handler,
 }
 
 inline void connection::read_packet_body(read_handler handler, std::size_t remaining_length) {
+    // A peer controls this number, and the buffer below is allocated at its full
+    // size.  Without a bound, a four-byte length of 268435455 asks for 256 MiB
+    // before a single payload byte has arrived.
+    if (remaining_length > max_packet_size_) {
+        reading_depth_ = 0;
+        io_.post([handler]() {
+            handler(asio::error::make_error_code(asio::error::message_size), {});
+        });
+        return;
+    }
+
     if (remaining_length == 0) {
         std::vector<uint8_t> packet(read_header_);
         reading_depth_ = 0;

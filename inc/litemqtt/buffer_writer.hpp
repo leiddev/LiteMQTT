@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -57,7 +58,13 @@ public:
         b.push_back(static_cast<uint8_t>(value & 0xFF));
     }
 
+    /// Writes a length-prefixed string.  Throws std::length_error rather than
+    /// truncating the length to 16 bits, which would produce a frame whose
+    /// prefix disagrees with its contents.
     void write_string(const std::string& str) {
+        if (str.size() > 0xFFFF) {
+            throw std::length_error("MQTT string longer than 65535 bytes");
+        }
         write_uint16(static_cast<uint16_t>(str.size()));
         if (!str.empty()) {
             auto& b = buffer();
@@ -71,7 +78,15 @@ public:
         b.insert(b.end(), data, data + len);
     }
 
+    /// Largest value the variable-length encoding can carry (MQTT 3.1.1
+    /// section 2.2.3).  Anything above it needs five bytes, which no decoder
+    /// accepts, so it throws std::length_error instead.
+    static constexpr std::size_t kMaxRemainingLength = 268435455;
+
     void write_remaining_length(std::size_t length) {
+        if (length > kMaxRemainingLength) {
+            throw std::length_error("MQTT remaining length exceeds 268435455");
+        }
         auto& b = buffer();
         uint8_t digit = 0;
         uint32_t val = static_cast<uint32_t>(length);
