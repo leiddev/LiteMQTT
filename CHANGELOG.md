@@ -11,6 +11,41 @@ replacing them.
 
 ### Fixed
 
+- **A packet can no longer be read past the remaining-length buffer.** When the
+  length field used a fourth continuation byte, `read_remaining_length_step()`
+  indexed `byte_buffer[4]` before checking the bound, reading one byte past a
+  `std::array<uint8_t, 4>`.  A peer that sent five continuation bytes in a row
+  drove the read out of bounds; with MSVC's iterator debugging it aborts, and
+  without it the value is whatever follows the array in the connection object.
+  The bound is now checked before the byte is read.
+
+- **`acquire_packet_id()` can report exhaustion.** The search bounded itself by
+  comparing the cursor against the id it started after, but that id is one that
+  was already handed out, so the walk wrapped around and returned an id that may
+  still be free.  A session with all 65535 packet ids in use silently reused one
+  instead of noticing.  It now counts the ids it has probed and returns 0 (and
+  closes the session) when none is free.
+
+- **`parse()` rejects malformed packets instead of returning half a struct.**
+  Every parser ignored the `buffer_reader` return values and never compared the
+  declared remaining length against the bytes present.  A two-byte CONNACK, for
+  example, produced `return_code == 0`, indistinguishable from a successful
+  connect.  `parse()` now takes the target by reference and returns `bool`;
+  truncated, padded and wrongly-typed packets are rejected, as is a PUBLISH with
+  the reserved QoS 3.  Malformed packets reaching `mqtt_client` are logged as
+  protocol errors and close the session.
+
+- **SUBACK length mismatch is caught with or without a callback.**
+  `handle_suback()` returned early when the caller passed no callback, before
+  checking that the broker answered every filter.  `mqtt_helper` restores
+  subscriptions with a null callback, so the check was skipped on every
+  reconnect.  The count check now runs first.
+
+- **`async_subscribe()` refuses without a session.** It queued the SUBSCRIBE
+  whenever the client was not closed, including while connecting and after a
+  failed handshake, leaving `pending_subscribes_` entries nothing would resolve.
+  It now reports failure through the callback, like `async_publish()`.
+
 - **QoS 2 publishes now complete.** `handle_pubrec()` moved the publish into the
   PUBREL half of the handshake but left the entry in `pending_publishes_`, which
   carried no callback.  `handle_pubcomp()` therefore found nothing to report and
@@ -38,13 +73,30 @@ replacing them.
 
 ### Added
 
-- `mqtt_client::set_retry_interval_for_test()` and
-  `set_max_retransmits_for_test()`, to drive the QoS 1/2 retransmit timers from
-  a test.  The defaults are unchanged (5 s, 3 attempts).  These are test hooks,
-  not part of the supported API.
+- `connection::set_max_packet_size()` / `max_packet_size()`.  A peer controls the
+  remaining length and the body buffer is allocated at its full size, so a
+  declared length of 268435455 asked for 256 MiB before a payload byte arrived.
+  The default cap is 1 MiB and a larger packet is reported as
+  `asio::error::message_size`.  **Behaviour change**: a client that exchanges
+  messages above 1 MiB has to raise the cap, or set it to 0 to disable the check.
+- `mqtt_helper::set_max_reconnect_delay()`, so the exponential backoff ceiling is
+  configurable instead of a hardcoded 30 s.
+- `mqtt_client::set_retry_interval_for_test()`,
+  `set_max_retransmits_for_test()` and `debug_set_next_packet_id()`, to drive the
+  retransmit timers and the id allocator from a test.  Test hooks, not part of
+  the supported API.
+- `buffer_writer::kMaxRemainingLength`.
 
 ### Changed
 
+- `buffer_writer::write_string()` and `write_remaining_length()` throw
+  `std::length_error` instead of emitting a frame that contradicts its own length
+  prefix: a string over 65535 bytes was truncated to a prefix of 0, and a length
+  over 268435455 produced a five-byte field no decoder accepts.  `serialize()`
+  surfaces this, so an oversized topic, payload or client id now throws where it
+  used to build a corrupt packet.
+- `connect_packet::parse()` enforces the protocol name, the protocol level and
+  MQTT 3.1.1 section 3.1.2.9 (a password flag without a user name is invalid).
 - The retransmit interval and retry limit are members rather than hardcoded
   literals; the unused `kPublishRetryInterval` constant is gone.  Behaviour with
   the default configuration is identical.
@@ -62,7 +114,20 @@ replacing them.
 ### Tests
 
 Not part of the released headers, listed because they back the fixes above.
+The suite went from 55 cases in 5 files to 116 in 7.
 
+- `test/robustness_test.cc` feeds every parser truncated, padded, wrongly-typed
+  and over-long input, plus the CONNECT edge cases (wrong protocol name or
+  level, password without user name).
+- `test/connection_test.cc` drives inbound framing errors over a real socket:
+  reserved packet types, a five-byte remaining length, and a declared body above
+  the new cap (which previously allocated 256 MiB and hung).
+- `test/client_test.cc` covers the CONNACK accept/refuse paths, malformed
+  packets, the SUBACK count check with and without a callback, the subscribe
+  guards, packet id exhaustion and inbound PUBLISH rejection.
+- `test/helper_test.cc` adds publish-after-stop, backoff growth to its ceiling,
+  the connect timeout, and both keepalive directions.
+- `test/codec_test.cc` adds the encoder boundaries.
 - `test/qos_test.cc` drives a real `mqtt_client` over loopback: QoS 1
   retransmission with the DUP flag and a stable packet id, giving up after the
   configured attempts, an acknowledged publish never being retransmitted, a
