@@ -102,7 +102,7 @@ endif()
 # be run by hand; only the unit tests are registered with CTest.
 # ---------------------------------------------------------------------------
 if(LITEMQTT_BUILD_EXAMPLES)
-    add_executable(LiteMQTTDemo main.cc)
+    add_executable(LiteMQTTDemo examples/demo.cc)
     target_link_libraries(LiteMQTTDemo PRIVATE LiteMQTT::litemqtt litemqtt_build_flags)
 
     add_executable(reconnect_probe tools/reconnect_probe.cc)

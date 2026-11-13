@@ -33,11 +33,13 @@ A lightweight, header-only MQTT v3.1.1 client library written in C++14, powered 
 ```
 LiteMQTT/
 ├── CMakeLists.txt          # Top-level build file
-├── main.cc                 # Demo application
 ├── 3rdparty/
 │   └── asio/               # Vendored standalone Asio; CMakeLists.txt defines the `asio` target
 ├── cmake/
 │   └── LiteMQTTConfig.cmake.in  # Package config installed next to LiteMQTTTargets.cmake
+├── examples/
+│   ├── README.md           # How to run the demo against a broker
+│   └── demo.cc             # Demo application (built as LiteMQTTDemo)
 ├── inc/
 │   └── litemqtt/
 │       ├── litemqtt.hpp    # Umbrella header
@@ -51,14 +53,19 @@ LiteMQTT/
 │       ├── log.hpp         # Log levels, callback interface & default sink
 │       └── mqtt_helper.hpp # High-level helper with auto-reconnect
 ├── test/
+│   ├── loopback_broker.hpp # Scripted MQTT peer shared by the socket tests
 │   ├── codec_test.cc       # GoogleTest unit tests
 │   ├── client_test.cc
+│   ├── qos_test.cc         # QoS 1/2 handshakes, retransmission, give-up
 │   ├── connection_test.cc  # Framing, write serialization
 │   ├── helper_test.cc      # Lifetime, stop()/start(), backoff
 │   └── log_test.cc
-└── tools/
-    ├── reconnect_probe.cc   # Reconnect / leak probe suite
-    └── reconnect_stress.cc  # Publish-while-reconnecting stress harness
+├── tools/
+│   ├── reconnect_probe.cc   # Reconnect / leak probe suite
+│   └── reconnect_stress.cc  # Publish-while-reconnecting stress harness
+└── docs/
+    ├── LiteMQTT设计文档.md
+    └── 测试补充清单.md      # What the tests cover, and the gaps left
 ```
 
 ## Build
@@ -80,10 +87,10 @@ cmake --build build
 
 The build produces:
 
-- `LiteMQTTDemo` – the demo client (`main.cc`)
+- `LiteMQTTDemo` – the demo client (`examples/demo.cc`)
 - `reconnect_probe` – reconnect / leak probe suite (`tools/`)
 - `reconnect_stress` – publish-while-reconnecting stress harness (`tools/`)
-- `codec_test`, `client_test`, `connection_test`, `helper_test`, `log_test` – unit tests
+- `codec_test`, `client_test`, `qos_test`, `connection_test`, `helper_test`, `log_test` – unit tests
   (if GoogleTest is available)
 
 ### Windows / MSVC
@@ -169,7 +176,8 @@ instead of passing.
 
 ## Running
 
-The demo client connects to a local broker, subscribes to a topic and publishes one message:
+The demo client connects to a local broker, subscribes to a topic and publishes
+a message every 10 ms until Ctrl-C:
 
 ```bash
 ./LiteMQTTDemo --host 127.0.0.1 --port 1883 \
@@ -189,7 +197,9 @@ With authentication:
                --payload "Hello from LiteMQTT!"
 ```
 
-Press Ctrl-C to disconnect and exit.
+The demo needs a broker of its own: it does not start one, and the publish loop
+runs at a fixed rate.  Every option and what the program does with them is
+described in [examples/README.md](examples/README.md).
 
 ## Reconnect Probes
 
