@@ -457,8 +457,13 @@ private:
 
     void send(const std::shared_ptr<session>& s, std::vector<uint8_t> data) {
         auto self = s;
-        asio::async_write(s->sock, asio::buffer(data),
-                          [self, data](const asio::error_code&, std::size_t) {});
+        // The bytes have to outlive the operation.  asio::buffer(data) pointed at
+        // this parameter, which is destroyed when send() returns, while the write
+        // completes much later; the completion handler's own copy of `data` is a
+        // different object and does not keep the buffer alive.
+        auto frame = std::make_shared<std::vector<uint8_t>>(std::move(data));
+        asio::async_write(s->sock, asio::buffer(*frame),
+                          [self, frame](const asio::error_code&, std::size_t) {});
     }
 
     int port_;
