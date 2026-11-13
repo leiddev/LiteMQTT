@@ -86,6 +86,35 @@ The build produces:
 - `codec_test`, `client_test`, `connection_test`, `helper_test`, `log_test` – unit tests
   (if GoogleTest is available)
 
+### Windows / MSVC
+
+MSVC needs its environment loaded before CMake runs: without it the compiler is
+found but `rc.exe` and `mt.exe` are not, and every link step fails. Configure from
+a "x64 Native Tools Command Prompt" (or after calling `vcvars64.bat`), and let
+CMake pick up `ninja.exe` from the PATH that the environment sets:
+
+```bat
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+cmake -S . -B build_test -G Ninja -DCMAKE_BUILD_TYPE=Debug ^
+      -DLITEMQTT_REQUIRE_TESTS=ON -DLITEMQTT_FETCH_GTEST=ON
+cmake --build build_test --parallel 4
+ctest --test-dir build_test --output-on-failure
+```
+
+`LITEMQTT_FETCH_GTEST=ON` matters here: Windows has no package manager that
+ships GoogleTest, so without it the test targets are silently not created and
+`ctest` reports "No tests were found". `LITEMQTT_REQUIRE_TESTS=ON` turns that
+silent skip into a configure error. Both need network access the first time.
+
+`build_test/` is a separate tree from the Visual Studio generator output in
+`build/`, which builds the demo and the tools but no tests. Both are ignored by
+git.
+
+Do not pass `CMAKE_MAKE_PROGRAM` by hand through `cmd //c` with a quoted path: not
+all shells hand the quotes through intact, and a botched run leaves a
+`ninja.exe/ninja.exe/...` cache entry that no build can use. Delete the build
+directory and reconfigure if that already happened.
+
 Everything is optional, and everything defaults to ON only when LiteMQTT is the
 top-level project; dropped into another tree with `add_subdirectory`, it becomes
 just the library plus a target the parent can link.
