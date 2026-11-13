@@ -33,6 +33,7 @@ A lightweight, header-only MQTT v3.1.1 client library written in C++14, powered 
 ```
 LiteMQTT/
 ├── CMakeLists.txt          # Top-level build file
+├── CHANGELOG.md            # Notable changes, by release
 ├── 3rdparty/
 │   └── asio/               # Vendored standalone Asio; CMakeLists.txt defines the `asio` target
 ├── cmake/
