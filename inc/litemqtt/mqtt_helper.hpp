@@ -46,6 +46,11 @@ public:
     /// milliseconds and let the reconnect policy take over; 0 disables it.
     /// Configure it before start().  Default 10000 ms.
     void set_connect_timeout(int ms);
+    /// Largest inbound packet body accepted; 0 disables the check.  Configure it
+    /// before start().  Default connection::kDefaultMaxPacketSize (1 MiB), which
+    /// covers ordinary IoT payloads but not a large retained document.  A broker
+    /// that declares a bigger packet has its read failed rather than honoured.
+    void set_max_packet_size(std::size_t bytes);
     /// Automatic reconnection policy; configure it before start().
     ///   max_attempts == -1  retry forever, always waiting base_delay_ms
     ///                       (no exponential growth)
@@ -130,6 +135,7 @@ private:
     uint16_t keep_alive_seconds_ = 60;
     bool clean_session_ = true;
     int connect_timeout_ms_ = 10000;
+    std::size_t max_packet_size_ = connection::kDefaultMaxPacketSize;
 
     int max_reconnect_attempts_ = 10;
     int base_reconnect_delay_ms_ = 1000;
@@ -192,6 +198,10 @@ inline void mqtt_helper::set_clean_session(bool clean) {
 
 inline void mqtt_helper::set_connect_timeout(int ms) {
     connect_timeout_ms_ = (ms < 0) ? 0 : ms;
+}
+
+inline void mqtt_helper::set_max_packet_size(std::size_t bytes) {
+    max_packet_size_ = bytes;
 }
 
 inline void mqtt_helper::set_reconnect_config(int max_attempts,
@@ -429,6 +439,9 @@ inline void mqtt_helper::init_client() {
     client->set_keep_alive(keep_alive_seconds_);
     client->set_clean_session(clean_session_);
     client->set_connect_timeout(connect_timeout_ms_);
+    // Applied on every session, not just the first: start() (and a reconnect
+    // through it) builds a fresh mqtt_client, which builds a fresh connection.
+    client->set_max_packet_size(max_packet_size_);
     if (!username_.empty()) {
         client->set_username(username_);
     }

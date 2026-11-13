@@ -374,6 +374,29 @@ TEST(MqttClientGuards, SubscribeRejectsInvalidQos) {
     }
 }
 
+// --- inbound packet size cap ----------------------------------------------
+
+// The cap lives on the connection; the client has to forward it, otherwise a
+// caller who only holds an mqtt_client has no way to raise it.
+TEST(MqttClientPacketSize, DefaultsToOneMiB) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+    EXPECT_EQ(client->max_packet_size(), connection::kDefaultMaxPacketSize);
+    EXPECT_EQ(client->max_packet_size(), 1024u * 1024u);
+}
+
+TEST(MqttClientPacketSize, SetterReachesTheConnection) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+
+    client->set_max_packet_size(4u * 1024u * 1024u);
+    EXPECT_EQ(client->max_packet_size(), 4u * 1024u * 1024u);
+
+    // 0 is the documented "no check" value and must survive unchanged.
+    client->set_max_packet_size(0);
+    EXPECT_EQ(client->max_packet_size(), 0u);
+}
+
 // --- packet id allocation --------------------------------------------------
 
 TEST(MqttClientPacketId, NeverReturnsZero) {

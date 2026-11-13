@@ -378,6 +378,18 @@ helper->set_connect_timeout(10000);  // ms, default 10000; 0 disables the timeou
 A timed-out attempt is treated like any other failure: `on_connect(false, 255)`
 fires, the socket is closed and the reconnect policy decides what happens next.
 
+Inbound packets are size-checked, because the remaining length comes from the
+peer and the body buffer is allocated at its full size before any payload
+arrives:
+
+```cpp
+helper->set_max_packet_size(1024 * 1024);  // bytes, default 1 MiB; 0 disables
+```
+
+A packet above the cap fails the read rather than being buffered. Raise it if
+the broker delivers large retained documents or images; setting it to 0 gives
+the peer control over how much the client allocates.
+
 While a session is not connected, `publish()` does not queue and does not touch
 the socket — it reports `callback(false, topic, qos, 0)` immediately. That keeps
 a publish from a timer from tearing down a connect attempt that is in progress;

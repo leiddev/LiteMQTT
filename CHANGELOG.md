@@ -73,12 +73,15 @@ replacing them.
 
 ### Added
 
-- `connection::set_max_packet_size()` / `max_packet_size()`.  A peer controls the
-  remaining length and the body buffer is allocated at its full size, so a
-  declared length of 268435455 asked for 256 MiB before a payload byte arrived.
-  The default cap is 1 MiB and a larger packet is reported as
-  `asio::error::message_size`.  **Behaviour change**: a client that exchanges
-  messages above 1 MiB has to raise the cap, or set it to 0 to disable the check.
+- `connection::set_max_packet_size()` / `max_packet_size()`, forwarded by
+  `mqtt_client` and `mqtt_helper` so the cap is reachable from the high-level API
+  and survives the client a reconnect rebuilds.  A peer controls the remaining
+  length and the body buffer is allocated at its full size, so a declared length
+  of 268435455 asked for 256 MiB before a payload byte arrived.  The default cap
+  is `connection::kDefaultMaxPacketSize` (1 MiB) and a larger packet is reported
+  as `asio::error::message_size`.  **Behaviour change**: a client that exchanges
+  messages above 1 MiB has to raise the cap, or set it to 0 to disable the check
+  -- which hands the allocation size back to the peer.
 - `mqtt_helper::set_max_reconnect_delay()`, so the exponential backoff ceiling is
   configurable instead of a hardcoded 30 s.
 - `mqtt_client::set_retry_interval_for_test()`,

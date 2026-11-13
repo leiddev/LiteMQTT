@@ -40,6 +40,12 @@ public:
     /// before it is abandoned and reported through the connect callback as failed.
     /// 0 disables the timeout.  Default 10000 ms; set it before async_connect().
     void set_connect_timeout(int ms);
+    /// Largest inbound packet body accepted.  A broker that declares a bigger one
+    /// makes the read fail with asio::error::message_size instead of allocating
+    /// for it.  Default connection::kDefaultMaxPacketSize (1 MiB); 0 disables
+    /// the check.
+    void set_max_packet_size(std::size_t bytes);
+    std::size_t max_packet_size() const;
 
     void async_connect(const std::string& host, uint16_t port,
                         connect_cb callback = nullptr);
@@ -232,6 +238,12 @@ inline mqtt_client::mqtt_client(asio::io_context& io)
 }
 
 inline void mqtt_client::set_connect_timeout(int ms) { connect_timeout_ms_ = (ms < 0) ? 0 : ms; }
+
+inline void mqtt_client::set_max_packet_size(std::size_t bytes) {
+    conn_->set_max_packet_size(bytes);
+}
+
+inline std::size_t mqtt_client::max_packet_size() const { return conn_->max_packet_size(); }
 
 inline mqtt_client::~mqtt_client() {
     cancel_ping_timer();

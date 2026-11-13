@@ -265,6 +265,50 @@ TEST(MqttHelperOperations, SubscribeWithoutClientIsANoOp) {
     EXPECT_FALSE(helper->is_connected());
 }
 
+// --- inbound packet size ---------------------------------------------------
+
+// The cap has to actually reach the connection.  The helper does not expose its
+// client, so this checks the observable effect on a real session.  It runs
+// against the first (and only) connection the loopback peer accepts, which is
+// also why the "rebuilt on the next start()" path is covered by inspection
+// rather than by a second session here.
+TEST(MqttHelperPacketSize, CapIsAppliedOnConnect) {
+    loopback_broker broker;
+
+    auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", broker.port(), "cap-apply");
+    helper->set_log_handler([](const litemqtt::log_record&) {});
+    helper->set_reconnect_config(0, 10);
+    // 2 KiB, well below the 1 MiB default: the 4 KiB publish below must fail.
+    helper->set_max_packet_size(2048);
+
+    std::atomic<int> messages{0};
+    std::mutex topic_mutex;
+    std::string last_topic;
+    helper->on_message([&](std::string topic, std::string, uint8_t, uint16_t) {
+        ++messages;
+        std::lock_guard<std::mutex> lock(topic_mutex);
+        last_topic = std::move(topic);
+    });
+
+    helper->start();
+    ASSERT_TRUE(wait_for([&helper]() { return helper->is_connected(); }, 3000));
+
+    // Under the cap: delivered, so the session is known good before the next step.
+    broker.reply(litemqtt_test::make_raw_publish("small", std::string(512, 'x')));
+    ASSERT_TRUE(wait_for([&messages]() { return messages.load() >= 1; }, 3000))
+        << "a packet under the cap was not delivered";
+    {
+        std::lock_guard<std::mutex> lock(topic_mutex);
+        EXPECT_EQ(last_topic, "small");
+    }
+
+    // Over the cap: refused, so the message callback must not see it.
+    broker.reply(litemqtt_test::make_raw_publish("big", std::string(4096, 'x')));
+    std::this_thread::sleep_for(milliseconds(400));
+    EXPECT_EQ(messages.load(), 1) << "a packet above the cap was delivered";
+    helper->stop();
+}
+
 // --- backoff growth and its ceiling ---------------------------------------
 
 // The ceiling is what keeps a long outage from pushing the retry out to

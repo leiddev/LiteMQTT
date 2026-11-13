@@ -53,11 +53,14 @@ public:
         close_handler_ = std::move(handler);
     }
 
+    static constexpr std::size_t kDefaultMaxPacketSize = 1024 * 1024;
+
     /// Largest body this connection will read.  A PUBLISH larger than this is
     /// reported as asio::error::message_size instead of being buffered.  The
     /// default leaves room for a 1 MiB payload; MQTT itself allows up to
     /// 268435455, so raise it if the application really exchanges larger
-    /// messages.  0 disables the check.
+    /// messages.  0 disables the check, which gives the peer control over how
+    /// much the client allocates.
     void set_max_packet_size(std::size_t bytes) { max_packet_size_ = bytes; }
 
     std::size_t max_packet_size() const { return max_packet_size_; }
@@ -109,7 +112,7 @@ private:
     close_handler close_handler_;
 
     /// Guard against a peer asking for a huge allocation (see read_packet_body).
-    std::size_t max_packet_size_ = 1024 * 1024;
+    std::size_t max_packet_size_ = kDefaultMaxPacketSize;
 
     // Write queue: only touched from the io thread (async_write_packet() posts
     // the enqueue), which keeps it lock free.
