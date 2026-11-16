@@ -287,6 +287,13 @@ ASAN_OPTIONS=detect_leaks=1 ./reconnect_stress_asan --scenario mixed \
     --duration 30 --rss-limit-mb 4096
 ```
 
+ASan on Linux does not cover everything, though: asio only checks a buffer's
+validity when its iterator debugging is compiled in, which MSVC does for Debug
+builds (and gcc does under `_GLIBCXX_DEBUG`, off by default). A buffer view into
+a vector that has already been destroyed therefore surfaces as MSVC's
+"can't dereference invalidated vector iterator" instead. Run the harness in a
+Debug build too, which is what the Windows CI job does.
+
 ## Usage Example
 
 ### Using `mqtt_client` (Low-level async API)

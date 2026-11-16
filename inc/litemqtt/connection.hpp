@@ -129,12 +129,10 @@ private:
     std::size_t max_write_queue_ = kDefaultMaxWriteQueue;
 
     // Write queue: only touched from the io thread (async_write_packet() posts
-    // the enqueue), which keeps it lock free.
+    // the enqueue), which keeps it lock free.  The item being written is owned by
+    // its own completion handler (see do_write), so writing_ is all that is left
+    // to say whether one is out.
     std::deque<write_item> write_queue_;
-    // The item currently being written.  It is taken out of write_queue_ so that
-    // close() can fail everything that is still waiting without disturbing the
-    // buffer asio is using right now.
-    std::unique_ptr<write_item> in_flight_;
     bool writing_ = false;
     // Set by close(); makes close() idempotent and keeps enqueue_write() from
     // parking handlers on a dead connection.
@@ -367,21 +365,19 @@ inline void connection::do_write() {
     }
 
     writing_ = true;
-    in_flight_.reset(new write_item(std::move(write_queue_.front())));
+
+    // The buffer travels with the operation, not in a member: close() can run while
+    // the write is still queued in asio, and a member it owned would be destroyed
+    // with the connection object while asio still holds a view of it.  The completion
+    // handler is what keeps the bytes alive, so they last exactly as long as the
+    // operation.
+    auto item = std::make_shared<write_item>(std::move(write_queue_.front()));
     write_queue_.pop_front();
 
     auto self = shared_from_this();
     asio::async_write(socket_,
-        asio::buffer(in_flight_->buffer),
-        [this, self](const asio::error_code& ec, std::size_t /*bytes*/) {
-            if (!in_flight_) {
-                // close() already took it over and reported the failure.
-                return;
-            }
-            // The buffer being written lives in in_flight_ and is only released
-            // here, once asio is done with it -- this is what makes passing a
-            // temporary serialized packet safe.
-            std::unique_ptr<write_item> item(std::move(in_flight_));
+        asio::buffer(item->buffer),
+        [this, self, item](const asio::error_code& ec, std::size_t /*bytes*/) {
             writing_ = false;
 
             if (item->handler) {
@@ -424,8 +420,11 @@ inline void connection::close() {
     }
     closed_ = true;
 
-    // Closing the socket cancels the write that is in flight; its completion
-    // handler sees an empty in_flight_ and stays quiet.
+    // Closing the socket cancels the write that is in flight.  Its handler already
+    // owns the bytes being written, so it is left alone here: the aborted completion
+    // reports the failure, and its own error path drops the socket and fails the
+    // queue.  Taking the operation over from here would destroy a buffer the pending
+    // operation still points at.
     asio::error_code ec;
     socket_.close(ec);
     state_ = connection_state::disconnected;
@@ -434,12 +433,7 @@ inline void connection::close() {
     // shared_ptr to the owner of this connection (mqtt_client owns it), so an
     // item left in the queue would form a cycle neither object can break; the
     // caller also has to hear about the failure rather than wait forever.
-    std::unique_ptr<write_item> in_flight(std::move(in_flight_));
-    writing_ = false;
     fail_pending_writes(asio::error::operation_aborted);
-    if (in_flight && in_flight->handler) {
-        in_flight->handler(asio::error::operation_aborted);
-    }
 
     if (close_handler_) {
         close_handler_();
