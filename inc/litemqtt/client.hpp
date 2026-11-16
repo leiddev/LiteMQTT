@@ -473,12 +473,11 @@ inline void mqtt_client::handle_connack(const std::vector<uint8_t>& data) {
         conn_->mark_connected();
         closed_ = false;
         session_established_ = true;
-        // The accepted session is the only thing the connect timeout still has
-        // to watch: a refusal, a socket error or a timeout all cancel it when
-        // they end their attempt, but a socket the broker closes right after the
-        // CONNACK leaves nothing else to notice.  Left pending, this wait fires
-        // against whatever attempt comes next.
-        connect_timer_->cancel(asio::error_code());
+        // The handshake is over, so the connect timeout has nothing left to watch.
+        // A refusal, a socket error or a timeout all cancel it when they end their
+        // attempt; left pending by an accepted CONNACK, it would fire against
+        // whatever attempt comes next.
+        cancel_connect_timeout();
     } else {
         // The broker refused the session (bad credentials, not authorized, ...).
         // Close the socket right away instead of leaving it to the next connect
