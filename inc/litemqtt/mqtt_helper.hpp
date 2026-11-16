@@ -160,6 +160,11 @@ private:
     std::shared_ptr<mqtt_client> lock_client() const;
     void do_connect();
     void do_reconnect();
+    /// Called from both close notifications, so that neither path can lose the
+    /// reconnect: on_close() reports an attempt that never came up, on_disconnected()
+    /// the loss of a session that was established, and a session that goes away is
+    /// exactly what has to bring the helper back.
+    void reconnect_after_close();
     void setup_callbacks();
     /// Delivers one transition to the installed callback, unless the helper has
     /// been stopped.
@@ -617,9 +622,7 @@ inline void mqtt_helper::setup_callbacks() {
         }
         LITEMQTT_LOG_TO(self->log_channel_, log_level::info)
             << "[mqtt_helper] Connection closed";
-        if (self->should_reconnect_.load() && !self->user_stopped_.load()) {
-            self->do_reconnect();
-        }
+        self->reconnect_after_close();
     });
 
     // A session that was up and went away.  Kept apart from on_close(), which
@@ -632,6 +635,10 @@ inline void mqtt_helper::setup_callbacks() {
             return;
         }
         self->emit_connection(connection_event::disconnected, 0);
+        // This is the path a session that was up takes when it goes away, so it is
+        // also the one that has to bring the helper back.  Report it first: the
+        // application hears about the disconnect before the retry is armed.
+        self->reconnect_after_close();
     });
 
     client->on_connect([weak](bool success, uint8_t rc) {
@@ -687,6 +694,13 @@ inline void mqtt_helper::do_connect() {
         << "[mqtt_helper] Initiating connection to " << host_ << ":" << port_ << "...";
 
     client->async_connect(host_, port_);
+}
+
+inline void mqtt_helper::reconnect_after_close() {
+    if (!should_reconnect_.load() || user_stopped_.load()) {
+        return;
+    }
+    do_reconnect();
 }
 
 inline void mqtt_helper::do_reconnect() {
