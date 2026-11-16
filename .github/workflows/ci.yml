@@ -73,6 +73,18 @@ jobs:
       - name: Stress harness (flap)
         run: .\build\Release\reconnect_stress.exe --scenario flap --duration 20
 
+      # A Debug build compiles asio's buffer debugging in, so it catches a buffer
+      # view that outlives its storage -- the crash this job used to miss because
+      # every other target here is built Release.
+      - name: Configure (Debug)
+        run: cmake -S . -B build-dbg -A x64 -DLITEMQTT_REQUIRE_TESTS=ON -DLITEMQTT_FETCH_GTEST=ON
+
+      - name: Build (Debug)
+        run: cmake --build build-dbg --config Debug --parallel 4
+
+      - name: Stress harness (flap, Debug)
+        run: .\build-dbg\Debug\reconnect_stress.exe --scenario flap --duration 20
+
   # ---------------------------------------------------------------------------
   # ARM64 Linux on GitHub's native arm64 runners (public repositories).  Runs
   # the same unit tests and the probe suite; the stress harness is left out

@@ -33,6 +33,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -196,6 +197,15 @@ private:
         asio::ip::tcp::socket sock;
         asio::steady_timer timer;
         std::string buf;
+        // Read and write targets live in the session, not in a vector allocated per
+        // operation: asio::buffer(std::vector&) carries the vector's iterator as a
+        // Debug-only validity check that runs when the operation completes, before
+        // the handler that owns the vector gets to run.  A raw pointer plus size
+        // carries no such check, and the session's shared_ptr is what the handler
+        // holds, so the storage is alive however the operation ends.
+        std::array<uint8_t, 4096> rx{};
+        // Every frame the broker sends is at most 4 bytes (CONNACK, PUBACK, PINGRESP).
+        std::array<uint8_t, 5> tx{};
         uint16_t last_pid = 0;
         long long last_seq = -1;
         bool have_last = false;
@@ -328,33 +338,34 @@ private:
 
     void read_loop(const std::shared_ptr<session>& s) {
         auto self = s;
-        auto buffer = std::make_shared<std::vector<uint8_t>>(4096);
-        s->sock.async_read_some(asio::buffer(*buffer), [this, self, buffer](
-                                                           const asio::error_code& ec,
-                                                           std::size_t n) {
-            if (ec) {
-                forget(self);
-                return;
-            }
-            self->buf.append(reinterpret_cast<const char*>(buffer->data()), n);
-            process(self);
-            if (!self->sock.is_open()) {
-                forget(self);
-                return;
-            }
-            if (state_.load() == link_state::slow) {
-                // Throttle: one chunk every 3 ms keeps the client's write queue
-                // backed up, which is what a congested link looks like.
-                auto weak = std::weak_ptr<session>(self);
-                self->timer.expires_after(milliseconds(3));
-                self->timer.async_wait([this, weak](const asio::error_code& ec) {
-                    if (ec) return;
-                    if (auto locked = weak.lock()) read_loop(locked);
-                });
-                return;
-            }
-            read_loop(self);
-        });
+        s->sock.async_read_some(asio::buffer(s->rx.data(), s->rx.size()),
+                                [this, self](const asio::error_code& ec, std::size_t n) {
+                                    if (ec) {
+                                        forget(self);
+                                        return;
+                                    }
+                                    self->buf.append(
+                                        reinterpret_cast<const char*>(self->rx.data()), n);
+                                    process(self);
+                                    if (!self->sock.is_open()) {
+                                        forget(self);
+                                        return;
+                                    }
+                                    if (state_.load() == link_state::slow) {
+                                        // Throttle: one chunk every 3 ms keeps the client's
+                                        // write queue backed up, which is what a congested
+                                        // link looks like.
+                                        auto weak = std::weak_ptr<session>(self);
+                                        self->timer.expires_after(milliseconds(3));
+                                        self->timer.async_wait(
+                                            [this, weak](const asio::error_code& ec) {
+                                                if (ec) return;
+                                                if (auto locked = weak.lock()) read_loop(locked);
+                                            });
+                                        return;
+                                    }
+                                    read_loop(self);
+                                });
     }
 
     void process(const std::shared_ptr<session>& s) {
@@ -455,15 +466,16 @@ private:
         }
     }
 
-    void send(const std::shared_ptr<session>& s, std::vector<uint8_t> data) {
+    void send(const std::shared_ptr<session>& s, std::initializer_list<uint8_t> data) {
         auto self = s;
-        // The bytes have to outlive the operation.  asio::buffer(data) pointed at
-        // this parameter, which is destroyed when send() returns, while the write
-        // completes much later; the completion handler's own copy of `data` is a
-        // different object and does not keep the buffer alive.
-        auto frame = std::make_shared<std::vector<uint8_t>>(std::move(data));
-        asio::async_write(s->sock, asio::buffer(*frame),
-                          [self, frame](const asio::error_code&, std::size_t) {});
+        // The bytes have to outlive the operation -- see the comment on session::tx.
+        // Writes are only started from this socket's own completion handlers, so no
+        // second write can be in flight while tx is being refilled, and a write that
+        // completes inline in async_write is done before the copy below.
+        const std::size_t n = std::min(data.size(), s->tx.size());
+        std::copy(data.begin(), data.begin() + static_cast<long>(n), s->tx.begin());
+        asio::async_write(s->sock, asio::buffer(s->tx.data(), n),
+                          [self](const asio::error_code&, std::size_t) {});
     }
 
     int port_;
