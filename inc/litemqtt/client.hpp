@@ -46,6 +46,12 @@ public:
     /// the check.
     void set_max_packet_size(std::size_t bytes);
     std::size_t max_packet_size() const;
+    /// Upper bound on queued outbound frames.  A broker that stops reading lets
+    /// the write queue grow without bound, so once this many frames are waiting
+    /// further publishes fail through their callback instead of being buffered.
+    /// Default connection::kDefaultMaxWriteQueue (1024); 0 disables the check.
+    void set_max_write_queue(std::size_t frames);
+    std::size_t max_write_queue() const;
 
     void async_connect(const std::string& host, uint16_t port,
                         connect_cb callback = nullptr);
@@ -244,6 +250,12 @@ inline void mqtt_client::set_max_packet_size(std::size_t bytes) {
 }
 
 inline std::size_t mqtt_client::max_packet_size() const { return conn_->max_packet_size(); }
+
+inline void mqtt_client::set_max_write_queue(std::size_t frames) {
+    conn_->set_max_write_queue(frames);
+}
+
+inline std::size_t mqtt_client::max_write_queue() const { return conn_->max_write_queue(); }
 
 inline mqtt_client::~mqtt_client() {
     cancel_ping_timer();

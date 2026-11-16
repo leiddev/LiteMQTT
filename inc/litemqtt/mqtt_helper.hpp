@@ -51,6 +51,11 @@ public:
     /// covers ordinary IoT payloads but not a large retained document.  A broker
     /// that declares a bigger packet has its read failed rather than honoured.
     void set_max_packet_size(std::size_t bytes);
+    /// Upper bound on queued outbound frames; 0 disables the check.  Configure it
+    /// before start().  Default connection::kDefaultMaxWriteQueue (1024).  Once
+    /// the queue is full a publish fails through its callback rather than being
+    /// buffered, so a broker that stops reading cannot grow it without bound.
+    void set_max_write_queue(std::size_t frames);
     /// Automatic reconnection policy; configure it before start().
     ///   max_attempts == -1  retry forever, always waiting base_delay_ms
     ///                       (no exponential growth)
@@ -136,6 +141,7 @@ private:
     bool clean_session_ = true;
     int connect_timeout_ms_ = 10000;
     std::size_t max_packet_size_ = connection::kDefaultMaxPacketSize;
+    std::size_t max_write_queue_ = connection::kDefaultMaxWriteQueue;
 
     int max_reconnect_attempts_ = 10;
     int base_reconnect_delay_ms_ = 1000;
@@ -202,6 +208,10 @@ inline void mqtt_helper::set_connect_timeout(int ms) {
 
 inline void mqtt_helper::set_max_packet_size(std::size_t bytes) {
     max_packet_size_ = bytes;
+}
+
+inline void mqtt_helper::set_max_write_queue(std::size_t frames) {
+    max_write_queue_ = frames;
 }
 
 inline void mqtt_helper::set_reconnect_config(int max_attempts,
@@ -442,6 +452,7 @@ inline void mqtt_helper::init_client() {
     // Applied on every session, not just the first: start() (and a reconnect
     // through it) builds a fresh mqtt_client, which builds a fresh connection.
     client->set_max_packet_size(max_packet_size_);
+    client->set_max_write_queue(max_write_queue_);
     if (!username_.empty()) {
         client->set_username(username_);
     }

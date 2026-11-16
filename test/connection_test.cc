@@ -120,6 +120,84 @@ TEST(ConnectionWriteQueue, FailsWritesThatCannotBeSent) {
     EXPECT_EQ(errors.load(), 1);
 }
 
+// --- write queue bound -----------------------------------------------------
+
+// A peer that stops reading stalls the socket; nothing drains the queue until it
+// becomes writable again, so without a bound a slow or hostile peer decides how
+// much the client buffers.  Once the queue is full a frame is refused instead.
+TEST(ConnectionWriteQueue, RefusesFramesBeyondTheBound) {
+    // A connected socket whose peer never reads: the socket buffer fills and the
+    // queue behind it is what grows.  The accept blocks, and so does the connect
+    // that feeds it, so the peer runs on its own thread.
+    asio::io_context peer_io;
+    asio::ip::tcp::acceptor acc(peer_io, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), 0));
+    const uint16_t port = acc.local_endpoint().port();
+    asio::ip::tcp::socket peer(peer_io);
+
+    std::thread acceptor([&]() {
+        asio::error_code ec;
+        acc.accept(peer, ec);
+    });
+
+    asio::io_context io;
+    auto conn = std::make_shared<litemqtt::connection>(io);
+    conn->set_max_write_queue(1);
+
+    std::atomic<bool> connected{false};
+    conn->async_connect("127.0.0.1", port, [&](const asio::error_code& ec) { connected = !ec; });
+
+    for (int i = 0; i < 400 && !connected.load(); ++i) {
+        io.poll();
+        io.restart();
+        std::this_thread::sleep_for(milliseconds(5));
+    }
+    acceptor.join();
+    ASSERT_TRUE(connected.load()) << "the connection never came up";
+
+    conn->mark_connected();
+    // Each frame is large enough that the first one cannot complete, so the rest
+    // queue up behind it and hit the bound.
+    const std::vector<uint8_t> frame(256 * 1024, 0xAB);
+    std::atomic<int> refused{0};
+    for (int i = 0; i < 8; ++i) {
+        conn->async_write_packet(frame, [&refused](const asio::error_code& wec) {
+            if (wec == asio::error::no_buffer_space) {
+                ++refused;
+            }
+        });
+    }
+
+    for (int i = 0; i < 400 && refused.load() == 0; ++i) {
+        io.poll();
+        io.restart();
+        std::this_thread::sleep_for(milliseconds(5));
+    }
+
+    EXPECT_GT(refused.load(), 0) << "the bound never refused a frame once full";
+
+    conn->close();
+    asio::error_code ignored;
+    peer.close(ignored);
+    io.restart();
+    io.run();
+}
+
+// 0 is the documented "no check" value.
+TEST(ConnectionWriteQueue, ZeroDisablesTheBound) {
+    asio::io_context io;
+    auto conn = std::make_shared<litemqtt::connection>(io);
+    conn->set_max_write_queue(0);
+    EXPECT_EQ(conn->max_write_queue(), 0u);
+}
+
+// The default has to be the named constant, not a second literal.
+TEST(ConnectionWriteQueue, DefaultsToTheNamedConstant) {
+    asio::io_context io;
+    auto conn = std::make_shared<litemqtt::connection>(io);
+    EXPECT_EQ(conn->max_write_queue(), litemqtt::connection::kDefaultMaxWriteQueue);
+    EXPECT_EQ(conn->max_write_queue(), 1024u);
+}
+
 // --- inbound framing errors -----------------------------------------------
 
 namespace {

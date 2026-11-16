@@ -65,6 +65,17 @@ public:
 
     std::size_t max_packet_size() const { return max_packet_size_; }
 
+    static constexpr std::size_t kDefaultMaxWriteQueue = 1024;
+
+    /// Upper bound on queued frames waiting to be written.  A peer that stops
+    /// reading stalls the socket, and this queue is what grows while it stays
+    /// that way; once it is full further frames are failed with
+    /// asio::error::no_buffer_space instead of being buffered.  0 disables the
+    /// check, which lets a slow peer drive the client's memory use.
+    void set_max_write_queue(std::size_t frames) { max_write_queue_ = frames; }
+
+    std::size_t max_write_queue() const { return max_write_queue_; }
+
     connection_state state() const {
         return state_.load();
     }
@@ -113,6 +124,9 @@ private:
 
     /// Guard against a peer asking for a huge allocation (see read_packet_body).
     std::size_t max_packet_size_ = kDefaultMaxPacketSize;
+
+    /// Guard against a peer that stops reading (see enqueue_write).
+    std::size_t max_write_queue_ = kDefaultMaxWriteQueue;
 
     // Write queue: only touched from the io thread (async_write_packet() posts
     // the enqueue), which keeps it lock free.
@@ -310,6 +324,19 @@ inline void connection::enqueue_write(std::vector<uint8_t> data, write_handler h
         io_.post([self, handler = std::move(handler)]() {
             if (handler) {
                 handler(asio::error::operation_aborted);
+            }
+        });
+        return;
+    }
+    if (max_write_queue_ != 0 && write_queue_.size() >= max_write_queue_) {
+        // A peer that stops reading lets this queue grow without bound: nothing
+        // drains it until the socket becomes writable.  Refuse the frame rather
+        // than buffer it, and report that through the handler the same way the
+        // closed-socket path does.
+        auto self = shared_from_this();
+        io_.post([self, handler = std::move(handler)]() {
+            if (handler) {
+                handler(asio::error::no_buffer_space);
             }
         });
         return;

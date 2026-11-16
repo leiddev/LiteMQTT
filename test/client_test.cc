@@ -397,6 +397,21 @@ TEST(MqttClientPacketSize, SetterReachesTheConnection) {
     EXPECT_EQ(client->max_packet_size(), 0u);
 }
 
+// The write-queue bound has to be reachable from the client for the same reason
+// the packet cap is: conn_ is private.
+TEST(MqttClientWriteQueue, DefaultsAndForwards) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+
+    EXPECT_EQ(client->max_write_queue(), connection::kDefaultMaxWriteQueue);
+
+    client->set_max_write_queue(64);
+    EXPECT_EQ(client->max_write_queue(), 64u);
+
+    client->set_max_write_queue(0);
+    EXPECT_EQ(client->max_write_queue(), 0u);
+}
+
 // --- packet id allocation --------------------------------------------------
 
 TEST(MqttClientPacketId, NeverReturnsZero) {

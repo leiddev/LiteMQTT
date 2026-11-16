@@ -82,6 +82,15 @@ replacing them.
   as `asio::error::message_size`.  **Behaviour change**: a client that exchanges
   messages above 1 MiB has to raise the cap, or set it to 0 to disable the check
   -- which hands the allocation size back to the peer.
+- `connection::set_max_write_queue()` / `max_write_queue()`, forwarded by
+  `mqtt_client` and `mqtt_helper`.  A peer that stops reading stalls the socket
+  and nothing drains the write queue until it becomes writable again, so this was
+  the one path a slow or hostile broker could use to grow the client's memory
+  without bound; QoS 0 in particular had no check at all, because
+  `pending_publishes_` only tracks QoS 1/2.  The bound is
+  `connection::kDefaultMaxWriteQueue` (1024 frames) and applies uniformly to
+  every frame, control packets included: once it is reached a frame fails with
+  `asio::error::no_buffer_space` instead of being buffered.  0 disables it.
 - `mqtt_helper::set_max_reconnect_delay()`, so the exponential backoff ceiling is
   configurable instead of a hardcoded 30 s.
 - `mqtt_client::set_retry_interval_for_test()`,

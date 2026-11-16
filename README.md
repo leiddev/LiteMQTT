@@ -390,6 +390,18 @@ A packet above the cap fails the read rather than being buffered. Raise it if
 the broker delivers large retained documents or images; setting it to 0 gives
 the peer control over how much the client allocates.
 
+The outbound side has a matching guard. A broker that stops reading stalls the
+socket, and the frames waiting behind it accumulate with nothing draining them,
+so the queue is bounded:
+
+```cpp
+helper->set_max_write_queue(1024);  // frames, default 1024; 0 disables
+```
+
+Once it is full a publish fails through its callback instead of being buffered.
+The bound counts frames rather than bytes, and applies to control packets as
+well as application messages.
+
 While a session is not connected, `publish()` does not queue and does not touch
 the socket — it reports `callback(false, topic, qos, 0)` immediately. That keeps
 a publish from a timer from tearing down a connect attempt that is in progress;
