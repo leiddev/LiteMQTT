@@ -9,6 +9,11 @@ replacing them.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-16
+
+Upgrading from 1.0.0 has one thing to look at: a packet over 1 MiB is now
+rejected by default.  See the `max_packet_size` entry under Added.
+
 ### Fixed
 
 - **A packet can no longer be read past the remaining-length buffer.** When the
@@ -70,6 +75,16 @@ replacing them.
   the session was closed without failing the pending publish, so its callback
   never ran.  `notify_closed_once()` now fails pending `pending_pubrecs_` entries
   the same way it fails pending QoS 1 publishes.
+
+- **A write in flight survives `close()`.** `do_write()` kept the bytes being
+  written in the member `in_flight_`, and `close()` moved that item out and
+  dropped it, destroying the buffer while asio still held a view of it.  In a
+  Debug build, where asio validates buffers through their iterator, the pending
+  operation then dereferenced the freed vector and aborted the process with
+  "can't dereference invalidated vector iterator".  Validation runs before the
+  completion handler, so capturing the buffer there could not have covered it.
+  The item now travels with its own operation and `close()` leaves the in-flight
+  write alone, letting its aborted completion report the failure.
 
 ### Added
 
@@ -148,6 +163,10 @@ The suite went from 55 cases in 5 files to 116 in 7.
 - `test/loopback_broker.hpp` is a scripted MQTT peer that records what it
   receives and sends only what the test queues.  Its teardown used to hang when
   the client never connected.
+- CI runs `reconnect_stress` in a Windows Debug build as well as Release.  Only
+  Debug compiles asio's buffer validation in, so it is the configuration that
+  catches a buffer view outliving its storage -- the abort fixed above went
+  unnoticed because every job built Release.
 
 ## [1.0.0] - 2026-11-06
 
@@ -168,5 +187,6 @@ First tagged release.
 - `reconnect_probe` and `reconnect_stress`, two loopback tools for exercising
   reconnection behaviour that unit tests cannot observe.
 
-[Unreleased]: https://github.com/leiddev/LiteMQTT/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/leiddev/LiteMQTT/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/leiddev/LiteMQTT/releases/tag/v1.1.0
 [1.0.0]: https://github.com/leiddev/LiteMQTT/releases/tag/v1.0.0

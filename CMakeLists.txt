@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(LiteMQTT
-    VERSION 1.0.0
+    VERSION 1.1.0
     DESCRIPTION "A small header-only MQTT client built on standalone Asio"
     LANGUAGES CXX)
 
