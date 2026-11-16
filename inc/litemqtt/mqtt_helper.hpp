@@ -26,6 +26,19 @@ using message_callback = std::function<void(
     uint16_t packet_id      // Packet ID
 )>;
 
+/// Connection state transition.  Unlike mqtt_client's connect_cb this fires once
+/// per real change: a state that is already reported is never reported again, and
+/// a failed attempt is one event rather than a failure plus a close.
+enum class connection_event {
+    connected,      ///< CONNACK accepted, session usable (subscriptions replayed)
+    disconnected,   ///< the connection that was up has been closed
+    connect_failed  ///< one connect attempt failed (CONNACK != 0 / timeout / TCP)
+};
+
+/// `return_code` is the CONNACK return code for connect_failed (255 for a
+/// transport level failure, see mqtt_client), and always 0 for the other events.
+using connection_callback = std::function<void(connection_event event, uint8_t return_code)>;
+
 class mqtt_helper : public std::enable_shared_from_this<mqtt_helper> {
 public:
     mqtt_helper() = delete;
@@ -75,6 +88,23 @@ public:
 
     // Core operations
     void on_message(message_callback callback);
+
+    /// Installs the connection state callback; a helper has one, so a second call
+    /// replaces the first.  Pass an empty callback to uninstall it.  Safe to call
+    /// from any thread.
+    ///
+    /// The callback runs on the io thread and must not block there: it would stall
+    /// every read, write and timer of this helper.  Calling the helper's own
+    /// methods from it is fine.  connected arrives after the subscriptions have
+    /// been replayed, so a publish from the callback is not lost to a missing
+    /// subscription.  Nothing is reported once stop() has been called.
+    void on_connection(connection_callback callback);
+
+    /// Number of successful connects since construction.  Monotonic, not reset by
+    /// start(): compare it against the connected events you received to notice a
+    /// callback that never arrived.  Safe to call from any thread.
+    std::uint64_t connected_count() const;
+
     void subscribe(const std::string& topic, uint8_t qos = 1);
     void subscribe(const std::string& topic, uint8_t qos,
                    std::function<void(bool success, std::string topic, uint8_t qos)> callback);
@@ -131,6 +161,9 @@ private:
     void do_connect();
     void do_reconnect();
     void setup_callbacks();
+    /// Delivers one transition to the installed callback, unless the helper has
+    /// been stopped.
+    void emit_connection(connection_event event, uint8_t return_code);
 
     std::string host_;
     uint16_t port_;
@@ -169,7 +202,9 @@ private:
     std::mutex pending_mutex_;
 
     message_callback message_callback_;
+    connection_callback connection_callback_;
     std::mutex callback_mutex_;
+    std::atomic<std::uint64_t> connected_count_{0};
 
     detail::log_channel log_channel_;
     std::mutex log_handler_mutex_;  ///< Guards creation of client_ vs. log config
@@ -241,6 +276,34 @@ inline void mqtt_helper::set_log_handler(log_handler handler) {
 inline void mqtt_helper::on_message(message_callback callback) {
     std::lock_guard<std::mutex> lock(callback_mutex_);
     message_callback_ = std::move(callback);
+}
+
+inline void mqtt_helper::on_connection(connection_callback callback) {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    connection_callback_ = std::move(callback);
+}
+
+inline std::uint64_t mqtt_helper::connected_count() const {
+    return connected_count_.load();
+}
+
+inline void mqtt_helper::emit_connection(connection_event event,
+                                         uint8_t return_code) {
+    // stop() sets this first, so a teardown in progress reports nothing; the
+    // events of a session that is going away are of no use to the application.
+    if (user_stopped_.load()) {
+        return;
+    }
+    // Copy under the lock, invoke without it: the callback may install another
+    // one, which would deadlock on a non-recursive mutex.
+    connection_callback callback;
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        callback = connection_callback_;
+    }
+    if (callback) {
+        callback(event, return_code);
+    }
 }
 
 inline void mqtt_helper::subscribe(const std::string& topic, uint8_t qos) {
@@ -504,6 +567,7 @@ inline void mqtt_helper::release_client() {
     // and ~mqtt_helper() (the only automatic stop()) never runs.
     client->on_message(nullptr);
     client->on_close(nullptr);
+    client->on_disconnected(nullptr);
     client->on_connect(nullptr);
 
     // The io thread is gone at this point, so this is the last chance to fail
@@ -558,6 +622,18 @@ inline void mqtt_helper::setup_callbacks() {
         }
     });
 
+    // A session that was up and went away.  Kept apart from on_close(), which
+    // reports the attempts that never got their CONNACK: one failed attempt used
+    // to show up as a close as well, which is what made an edge-triggered
+    // application see two disconnects for one failure.
+    client->on_disconnected([weak]() {
+        auto self = weak.lock();
+        if (!self) {
+            return;
+        }
+        self->emit_connection(connection_event::disconnected, 0);
+    });
+
     client->on_connect([weak](bool success, uint8_t rc) {
         auto self = weak.lock();
         if (!self) {
@@ -573,6 +649,7 @@ inline void mqtt_helper::setup_callbacks() {
             //    self->should_reconnect_.store(false);
             //    return;
             //}
+            self->emit_connection(connection_event::connect_failed, rc);
             self->do_reconnect();
             return;
         }
@@ -589,6 +666,13 @@ inline void mqtt_helper::setup_callbacks() {
                 client->async_subscribe(item.first, item.second, nullptr);
             }
         }
+
+        // Counted before it is reported, so that an application comparing the
+        // counter in its periodic tick never sees a connected event it has not
+        // been told about yet.  After the replay above: the session is only
+        // announced once it is usable.
+        self->connected_count_.fetch_add(1);
+        self->emit_connection(connection_event::connected, 0);
     });
 }
 

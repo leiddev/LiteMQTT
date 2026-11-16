@@ -328,6 +328,18 @@ int main() {
 }
 ```
 
+`on_close()` reports the end of a connect attempt that never got its CONNACK; the
+loss of a session that *was* established comes through `on_disconnected()`:
+
+```cpp
+client->on_disconnected([...]() {
+    // the session that was up has been closed (peer gone, keepalive timeout, ...)
+});
+```
+
+The two are mutually exclusive, so `on_connect(false, rc)` plus `on_disconnected()`
+covers every way a connection can end without reporting one failure twice.
+
 ### Using `mqtt_helper` (High-level API with auto-reconnect)
 
 ```cpp
@@ -374,6 +386,49 @@ int main() {
 After giving up, `is_reconnect_armed()` returns `false` and `rearm_reconnect()`
 puts the helper back to work (returns `false` if it is not running, in which case
 `start()` is what you need). Both are safe to call from any thread.
+
+#### Connection state callbacks
+
+The helper owns `mqtt_client::on_connect` and `on_close` for its reconnection
+logic, so an application cannot install its own on the underlying client — and
+those two callbacks report one failed attempt from more than one path. What it
+needs instead is one **edge** per state change:
+
+```cpp
+helper->on_connection([](litemqtt::connection_event event, uint8_t return_code) {
+    switch (event) {
+    case litemqtt::connection_event::connected:
+        // CONNACK accepted and the subscriptions replayed: publishing here is safe.
+        break;
+    case litemqtt::connection_event::disconnected:
+        // The session that was up has been closed.
+        break;
+    case litemqtt::connection_event::connect_failed:
+        // One attempt failed; return_code is the CONNACK code (4 = bad user name
+        // or password, 5 = not authorized), or 255 for a timeout / socket error.
+        break;
+    }
+});
+```
+
+| Event             | When                                                                    | `return_code`        |
+|-------------------|-------------------------------------------------------------------------|----------------------|
+| `connected`       | CONNACK accepted, after `subscribes_` were replayed                     | always 0             |
+| `disconnected`    | a connection that was established has been closed                       | always 0             |
+| `connect_failed`  | one connect attempt failed (CONNACK != 0, timeout, socket error)        | the CONNACK code, or 255 |
+
+A failed attempt reports `connect_failed` only — it never also reports
+`disconnected`, which is what separates a link that just went away from one that
+never came up. Nothing is reported after `stop()`. The callback runs on the io
+thread and must not block there, though calling the helper's own methods from it
+is fine.
+
+`connected_count()` is a monotonic count of successful connects, not reset by
+`start()`. Compare it in a periodic tick against the `connected` events you have
+seen: if it is ahead, an event was missed and any state machine you drive from
+these callbacks has to resynchronise.
+
+#### Connect timeout, packet size and queue bounds
 
 Every attempt is bounded by a connect timeout that covers TCP connect *and* the
 CONNACK wait, so a blackholed peer cannot stall the session forever:

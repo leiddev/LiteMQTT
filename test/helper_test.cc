@@ -4,6 +4,7 @@
 // cases use the scripted loopback peer.
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -415,13 +416,16 @@ TEST(MqttHelperKeepAlive, MissingPingrespClosesTheSession) {
     loopback_broker broker;  // never replies to anything after CONNACK
 
     auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", broker.port(), "ka-dead");
+    // The session is up when the keepalive notices the dead link, so its teardown
+    // is a connection event rather than the "Connection closed" log line, which
+    // belongs to attempts that never came up.
     std::atomic<int> closes{0};
-    helper->set_log_handler(
-        [&closes](const litemqtt::log_record& r) {
-            if (r.message.find("Connection closed") != std::string::npos) {
-                ++closes;
-            }
-        });
+    helper->on_connection([&closes](litemqtt::connection_event e, uint8_t) {
+        if (e == litemqtt::connection_event::disconnected) {
+            ++closes;
+        }
+    });
+    helper->set_log_handler([](const litemqtt::log_record&) {});
     helper->set_keep_alive(1);
     helper->set_reconnect_config(0, 10);
     helper->start();
@@ -432,4 +436,253 @@ TEST(MqttHelperKeepAlive, MissingPingrespClosesTheSession) {
         << "a missing PINGRESP never closed the session";
     EXPECT_FALSE(helper->is_connected());
     helper->stop();
+}
+
+// --- connection events -----------------------------------------------------
+
+namespace {
+
+/// Records every connection event together with its return code.
+struct event_log {
+    std::mutex mutex;
+    std::vector<std::pair<litemqtt::connection_event, uint8_t>> events;
+
+    void add(litemqtt::connection_event event, uint8_t rc) {
+        std::lock_guard<std::mutex> lock(mutex);
+        events.emplace_back(event, rc);
+    }
+
+    std::vector<std::pair<litemqtt::connection_event, uint8_t>> snapshot() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return events;
+    }
+
+    std::size_t count(litemqtt::connection_event event) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return static_cast<std::size_t>(std::count_if(
+            events.begin(), events.end(),
+            [event](const std::pair<litemqtt::connection_event, uint8_t>& e) {
+                return e.first == event;
+            }));
+    }
+};
+
+}  // namespace
+
+// A refused CONNACK used to surface twice -- once through the connect callback
+// and once as a close notification -- which is what an edge-triggered
+// application saw as two disconnects for one failure.
+TEST(MqttHelperEvents, RefusedConnackIsOneFailureCarryingItsCode) {
+    loopback_broker broker;
+    broker.set_handshake(loopback_broker::handshake::refuse);
+    broker.set_refuse_code(5);  // not authorized
+
+    auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", broker.port(), "ev-refuse");
+    event_log log;
+    helper->on_connection([&log](litemqtt::connection_event e, uint8_t rc) { log.add(e, rc); });
+    helper->set_log_handler([](const litemqtt::log_record&) {});
+    helper->set_connect_timeout(300);
+    helper->set_reconnect_config(-1, 50);  // keep retrying so there is more than one attempt
+    helper->start();
+
+    ASSERT_TRUE(wait_for([&log]() {
+        return log.count(litemqtt::connection_event::connect_failed) >= 2;
+    }, 3000)) << "no connect_failed events arrived";
+    helper->stop();
+
+    auto events = log.snapshot();
+    ASSERT_FALSE(events.empty());
+    EXPECT_EQ(log.count(litemqtt::connection_event::disconnected), 0u)
+        << "a connect attempt that never came up must not also report a disconnect";
+    EXPECT_EQ(log.count(litemqtt::connection_event::connected), 0u);
+    EXPECT_EQ(events[0].first, litemqtt::connection_event::connect_failed);
+    for (const auto& e : events) {
+        EXPECT_EQ(e.first, litemqtt::connection_event::connect_failed)
+            << "every event belongs to a failed attempt";
+        // The broker that refused the session closes the socket right after, so
+        // an attempt can fail either way.  Both carry the CONNACK code the broker
+        // returned; only a timeout has none (it reports 255).
+        EXPECT_TRUE(static_cast<int>(e.second) == 5 || static_cast<int>(e.second) == 255)
+            << "unexpected return code " << static_cast<int>(e.second);
+    }
+    EXPECT_EQ(helper->connected_count(), 0u);
+}
+
+// A peer that accepts the socket and never answers: the timeout path reports one
+// failure per attempt, with the transport level code.
+TEST(MqttHelperEvents, ConnectTimeoutIsOneFailure) {
+    loopback_broker broker;
+    broker.set_handshake(loopback_broker::handshake::silent);
+
+    auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", broker.port(), "ev-timeout");
+    event_log log;
+    helper->on_connection([&log](litemqtt::connection_event e, uint8_t rc) { log.add(e, rc); });
+    helper->set_log_handler([](const litemqtt::log_record&) {});
+    helper->set_connect_timeout(150);
+    // Retry once: the failure that ends an attempt must not spill into the next
+    // one, which is what counting the attempts here verifies.
+    helper->set_reconnect_config(1, 300);
+    helper->start();
+
+    ASSERT_TRUE(wait_for([&log]() {
+        return log.count(litemqtt::connection_event::connect_failed) >= 1;
+    }, 3000)) << "the abandoned attempt was never reported";
+    std::this_thread::sleep_for(milliseconds(450));  // past the retry, still silent
+    std::this_thread::sleep_for(milliseconds(100));
+    helper->stop();
+
+    auto events = log.snapshot();
+    ASSERT_FALSE(events.empty());
+    // A peer that accepts and says nothing can also drop the socket first, which
+    // is likewise a transport level failure: both report 255.
+    for (const auto& e : events) {
+        EXPECT_EQ(e.first, litemqtt::connection_event::connect_failed);
+        EXPECT_EQ(static_cast<int>(e.second), 255)
+            << "a transport level failure carries 255, as mqtt_client defines it";
+    }
+    // Two attempts at most (the first, then the single retry), never a third from
+    // a timer that outlived its attempt.
+    EXPECT_LE(events.size(), 2u) << "one attempt was reported more than once";
+    EXPECT_EQ(log.count(litemqtt::connection_event::disconnected), 0u);
+}
+
+// The edge an edge-triggered application needs: up, down, each exactly once.
+TEST(MqttHelperEvents, EstablishedSessionReportsConnectedAndDisconnectedInOrder) {
+    loopback_broker broker;
+
+    auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", broker.port(), "ev-edges");
+    event_log log;
+    helper->on_connection([&log](litemqtt::connection_event e, uint8_t rc) { log.add(e, rc); });
+    helper->set_log_handler([](const litemqtt::log_record&) {});
+    // No retry: the loopback peer serves one connection, so a second attempt
+    // would hang in the backoff and say nothing about the events.
+    helper->set_reconnect_config(0, 10);
+    helper->start();
+
+    ASSERT_TRUE(wait_for([&log]() { return log.count(litemqtt::connection_event::connected) == 1; },
+                         3000)) << "the first connect was never reported";
+    EXPECT_EQ(helper->connected_count(), 1u);
+
+    broker.close_client_connection();
+    ASSERT_TRUE(wait_for([&log]() {
+        return log.count(litemqtt::connection_event::disconnected) == 1;
+    }, 3000)) << "the teardown of an established session was not reported";
+
+    // Nothing else follows: the single teardown must not be reported twice.
+    std::this_thread::sleep_for(milliseconds(200));
+    helper->stop();
+
+    auto events = log.snapshot();
+    ASSERT_EQ(events.size(), 2u) << "one connect and one teardown, nothing else";
+    EXPECT_EQ(events[0].first, litemqtt::connection_event::connected);
+    EXPECT_EQ(events[1].first, litemqtt::connection_event::disconnected);
+    for (const auto& e : events) {
+        EXPECT_EQ(static_cast<int>(e.second), 0)
+            << "connected and disconnected always report return code 0";
+    }
+}
+
+// connected arrives once the subscriptions are usable, so a publish from the
+// callback is not lost to a missing subscription.
+TEST(MqttHelperEvents, ConnectedArrivesAfterTheSubscriptionsAreReplayed) {
+    loopback_broker broker;
+
+    auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", broker.port(), "ev-replay");
+    helper->set_log_handler([](const litemqtt::log_record&) {});
+    helper->set_reconnect_config(0, 10);
+    helper->subscribe("replay/topic", 1);
+
+    std::atomic<bool> connected{false};
+    helper->on_connection([&](litemqtt::connection_event e, uint8_t) {
+        if (e == litemqtt::connection_event::connected) {
+            connected.store(true);
+        }
+    });
+    helper->start();
+
+    // The replay runs just before the callback, so by the time connected is
+    // reported the SUBSCRIBE is already on its way to the peer.
+    ASSERT_TRUE(wait_for([&connected]() { return connected.load(); }, 3000))
+        << "connected was never reported";
+    ASSERT_TRUE(wait_for([&broker]() {
+        for (const auto& frame : broker.received()) {
+            if (!frame.empty() && (frame[0] >> 4) == 8) {  // SUBSCRIBE
+                return true;
+            }
+        }
+        return false;
+    }, 3000)) << "the subscription was not replayed";
+    helper->stop();
+}
+
+// The callback runs on the io thread, where re-entering the helper must not
+// deadlock on the mutex guarding the callback itself.
+TEST(MqttHelperEvents, ReentrantCallsFromTheCallbackAreSafe) {
+    loopback_broker broker;
+
+    auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", broker.port(), "ev-reentry");
+    helper->set_log_handler([](const litemqtt::log_record&) {});
+    helper->set_reconnect_config(0, 10);
+
+    std::atomic<int> reentered{0};
+    helper->on_connection([&helper, &reentered](litemqtt::connection_event e, uint8_t) {
+        if (e != litemqtt::connection_event::connected) {
+            return;
+        }
+        helper->on_message([](std::string, std::string, uint8_t, uint16_t) {});
+        (void)helper->is_connected();
+        (void)helper->connected_count();
+        helper->on_connection([](litemqtt::connection_event, uint8_t) {});  // uninstalls itself
+        ++reentered;
+    });
+    helper->start();
+
+    ASSERT_TRUE(wait_for([&reentered]() { return reentered.load() == 1; }, 3000))
+        << "calling helper methods from the callback deadlocked";
+    helper->stop();
+}
+
+TEST(MqttHelperEvents, EmptyCallbackUninstalls) {
+    loopback_broker broker;
+
+    auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", broker.port(), "ev-uninst");
+    helper->set_log_handler([](const litemqtt::log_record&) {});
+    helper->set_reconnect_config(-1, 20);
+
+    std::atomic<int> events{0};
+    helper->on_connection([&events](litemqtt::connection_event, uint8_t) { ++events; });
+    helper->start();
+
+    ASSERT_TRUE(wait_for([&helper]() { return helper->is_connected(); }, 3000));
+    ASSERT_TRUE(wait_for([&events]() { return events.load() >= 1; }, 3000));
+    helper->on_connection(litemqtt::connection_callback{});
+    const int after_uninstall = events.load();
+
+    broker.close_client_connection();
+    std::this_thread::sleep_for(milliseconds(300));
+    EXPECT_EQ(events.load(), after_uninstall) << "an empty callback must stop the reports";
+    helper->stop();
+}
+
+TEST(MqttHelperEvents, NoEventsAfterStop) {
+    loopback_broker broker;
+
+    auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", broker.port(), "ev-stop");
+    helper->set_log_handler([](const litemqtt::log_record&) {});
+    helper->set_reconnect_config(-1, 20);
+
+    std::atomic<int> events{0};
+    helper->on_connection([&events](litemqtt::connection_event, uint8_t) { ++events; });
+    helper->start();
+
+    ASSERT_TRUE(wait_for([&helper]() { return helper->is_connected(); }, 3000));
+    ASSERT_TRUE(wait_for([&events]() { return events.load() >= 1; }, 3000));
+    helper->stop();
+
+    const int after_stop = events.load();
+    std::this_thread::sleep_for(milliseconds(300));
+    EXPECT_EQ(events.load(), after_stop) << "stop() must silence the callback";
+    // The counter keeps what it counted; it is what the application compares
+    // against after a restart.
+    EXPECT_EQ(helper->connected_count(), 1u);
 }

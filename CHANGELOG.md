@@ -9,6 +9,59 @@ replacing them.
 
 ## [Unreleased]
 
+Upgrading has one thing to look at: `mqtt_client::on_close` no longer fires for a
+connection that went away after it was established.  See Changed.
+
+### Added
+
+- **`mqtt_helper::on_connection()` reports connection state transitions.** The
+  helper owns `mqtt_client::on_connect` and `on_close` for its reconnection
+  logic, so an application could not install its own without displacing that
+  logic, and the two callbacks report one failed attempt from more than one path
+  (a failed connect callback *and* a close notification). `on_connection()` gives
+  one edge per change: `connected` (after the subscriptions were replayed),
+  `disconnected`, and `connect_failed` with the CONNACK return code, or 255 for a
+  timeout or socket error. Nothing is reported after `stop()`.
+
+- **`mqtt_helper::connected_count()`.** A monotonic count of successful connects,
+  not reset by `start()`, so an application can compare it against the `connected`
+  events it received and notice one that never arrived.
+
+- **`mqtt_client::on_disconnected()`.** Reports the teardown of a session that was
+  established, separately from `on_close()`.
+
+### Fixed
+
+- **A connect timeout could tear down the session the next attempt had just
+  brought up.** The timeout wait belongs to one attempt, and a superseded wait can
+  be delivered with success once the timer has been re-armed for the next one; it
+  then ran against a connection that was already up.  Each wait is now tagged with
+  the attempt it belongs to, and every way an attempt ends (a socket error, a
+  refused CONNACK, an accepted one, a timeout) cancels it.
+
+- **A connection that was closed directly could never be read from again.**
+  `connection::close()` left the read state set, so a caller that closed the socket
+  itself and then started a new attempt on the same object heard nothing: the
+  transport connected and no CONNACK was ever processed.  `close()` now resets the
+  read state, and `connection::reset_after_close()` re-arms the object for the next
+  attempt — the refused-CONNACK and timeout paths in `mqtt_client` need it, because
+  they close the socket themselves.
+
+### Changed
+
+- **`mqtt_client::on_close` reports only attempts that never came up.** A close
+  notification used to mean "the link may be gone", covering both a session that
+  was established and one that never was.  It now fires only for a connect attempt
+  that ends without a session (a protocol error during the handshake, a peer that
+  drops the socket before CONNACK), while the teardown of an established session
+  goes to `on_disconnected()`.  As a result, a broker that closes the socket right
+  after a refused CONNACK no longer produces a second report of the same failure
+  alongside `on_connect(false, rc)`.
+
+  Applications that want both choose `on_disconnected()` for the teardown and
+  `on_connect(false, rc)` for the failure.  `mqtt_helper` users are unaffected apart
+  from the "Connection closed" log line, which now belongs to failed attempts.
+
 ## [1.1.0] - 2026-11-16
 
 Upgrading from 1.0.0 has one thing to look at: a packet over 1 MiB is now
