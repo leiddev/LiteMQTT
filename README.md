@@ -402,6 +402,23 @@ Once it is full a publish fails through its callback instead of being buffered.
 The bound counts frames rather than bytes, and applies to control packets as
 well as application messages.
 
+That last point is a deliberate trade-off worth knowing about. One queue holds
+everything the client sends — publishes, PUBACK/PUBREC/PUBCOMP, PINGREQ,
+SUBSCRIBE, CONNECT, DISCONNECT — and a single limit covers it. The alternative,
+reserving headroom for control frames, would guarantee that a PINGREQ can always
+be sent, at the cost of a second limit to tune and a second path to get wrong.
+
+The consequence: if the queue fills with large publishes while the broker is
+reading slowly, a PINGREQ waits behind them until the socket drains. 1024 frames
+is generous enough that this needs a genuinely extreme combination — a high
+publish rate against a peer that has nearly stopped reading — before keepalive
+starts to slip. If that ever shows up in practice, the fix is to reserve control
+frame slots rather than to raise the limit.
+
+A frame refused this way is reported through the publish callback, so a
+publisher that honours its callbacks sees the backpressure rather than growing
+its own backlog.
+
 While a session is not connected, `publish()` does not queue and does not touch
 the socket — it reports `callback(false, topic, qos, 0)` immediately. That keeps
 a publish from a timer from tearing down a connect attempt that is in progress;
