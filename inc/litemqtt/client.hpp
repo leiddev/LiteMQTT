@@ -23,6 +23,11 @@ namespace litemqtt {
 using connect_cb = std::function<void(bool success, uint8_t return_code)>;
 using message_cb = std::function<void(std::string topic, std::string payload, uint8_t qos, uint16_t packet_id)>;
 using close_cb = std::function<void()>;
+/// An established session was closed (peer gone, keepalive timeout, protocol
+/// error).  Mutually exclusive with connect_cb's failure: a connect attempt that
+/// never got its CONNACK is reported through connect_cb only, an established
+/// session that is torn down through this callback only.  Runs on the io thread.
+using disconnected_cb = std::function<void()>;
 using subscribe_cb = std::function<void(bool success, std::string topic, uint8_t qos_granted)>;
 using publish_cb = std::function<void(bool success, std::string topic, uint8_t qos, uint16_t packet_id)>;
 
@@ -73,6 +78,9 @@ public:
     void on_connect(connect_cb callback);
     void on_message(message_cb callback);
     void on_close(close_cb callback);
+    /// Fires instead of on_close() when the connection that was torn down had
+    /// completed its handshake; on_close() keeps reporting the ones that had not.
+    void on_disconnected(disconnected_cb callback);
     void on_subscribe(subscribe_cb callback);
     void on_publish(publish_cb callback);
 
@@ -101,7 +109,8 @@ public:
 private:
     void send_connect_packet();
     void handle_connack(const std::vector<uint8_t>& data);
-    void handle_connect_timeout();
+    void handle_connect_timeout(std::uint32_t attempt);
+    void cancel_connect_timeout();
     void start_read_loop();
     void schedule_pingreq();
     void cancel_ping_timer();
@@ -117,6 +126,7 @@ private:
     void cancel_publish_retry_timer(uint16_t packet_id);
     void finish_publish_success(uint16_t packet_id);
     void finish_publish_failure(uint16_t packet_id);
+    void cleanup_session();
     void notify_closed_once();
 
 public:
@@ -198,6 +208,7 @@ private:
     connect_cb on_connect_cb_;
     message_cb on_message_cb_;
     close_cb on_close_cb_;
+    disconnected_cb on_disconnected_cb_;
     subscribe_cb on_subscribe_cb_;
     publish_cb on_publish_cb_;
 
@@ -232,6 +243,14 @@ private:
     // (forever when keep_alive == 0).
     std::shared_ptr<asio::steady_timer> connect_timer_;
     int connect_timeout_ms_ = 10000;
+    /// Identifies the current connect attempt.  The timeout handler belongs to one
+    /// attempt only, and a superseded wait can still be delivered with success once
+    /// the timer has been re-armed for the next one.
+    std::uint32_t connect_attempt_ = 0;
+    /// Set once the session was established (CONNACK accepted), cleared when it is
+    /// torn down.  It is what separates the two halves of notify_closed_once(): the
+    /// loss of a session, or the end of an attempt that never came up.
+    bool session_established_ = false;
     bool closed_ = false;
 
     detail::log_channel log_channel_;
@@ -295,13 +314,22 @@ inline void mqtt_client::async_connect(const std::string& host, uint16_t port, c
     // would otherwise leave the session in "handshaking" until the keepalive
     // notices (1.5 x keep_alive) -- or forever when keep_alive == 0.
     if (connect_timeout_ms_ > 0) {
+        // The attempt number decides whether this handler still has a say.  A wait
+        // belonging to an earlier attempt is cancelled when the timer is re-armed,
+        // and depending on how the two deadlines line up asio can complete it with
+        // success instead of operation_aborted -- which used to tear down the
+        // session the next attempt had just brought up.
+        const auto attempt = ++connect_attempt_;
         auto self = shared_from_this();
         connect_timer_->expires_after(std::chrono::milliseconds(connect_timeout_ms_));
-        connect_timer_->async_wait([this, self](const asio::error_code& ec) {
+        connect_timer_->async_wait([this, self, attempt](const asio::error_code& ec) {
+            if ((attempt != connect_attempt_) || closed_) {
+                return;  // a later attempt owns the timer, or this one is over
+            }
             if (ec) {
                 return;  // cancelled: CONNACK arrived or the session closed
             }
-            handle_connect_timeout();
+            handle_connect_timeout(attempt);
         });
     }
 
@@ -314,6 +342,10 @@ inline void mqtt_client::async_connect(const std::string& host, uint16_t port, c
             if (ec) {
                 LITEMQTT_LOG_TO(log_channel_, log_level::error)
                     << "Socket connect failed: " << ec.message();
+                // The attempt is over and its timeout has nothing left to watch.
+                // Left pending, it would fire against whatever attempt comes next.
+                closed_ = true;
+                cancel_connect_timeout();
                 if (on_connect_cb_) on_connect_cb_(false, 255);
                 return;
             }
@@ -321,8 +353,10 @@ inline void mqtt_client::async_connect(const std::string& host, uint16_t port, c
         });
 }
 
-inline void mqtt_client::handle_connect_timeout() {
-    if (closed_) {
+inline void mqtt_client::handle_connect_timeout(std::uint32_t attempt) {
+    // Same gate as the timer handler in async_connect(): this must only act for
+    // the attempt whose timer fired, and only while that attempt is still open.
+    if ((attempt != connect_attempt_) || closed_) {
         return;
     }
     LITEMQTT_LOG_TO(log_channel_, log_level::error)
@@ -330,11 +364,21 @@ inline void mqtt_client::handle_connect_timeout() {
         << " ms; abandoning this attempt";
 
     // closed_ first, so the completion of the aborted TCP connect stays quiet.
-    // Report the failure through the connect callback, exactly like a refused
-    // CONNACK: that is what drives the reconnect policy.
+    // This closes the socket while the session was never established, so the
+    // close notification it triggers stays silent and the connection object has
+    // to be reset before the next attempt uses it.
     closed_ = true;
+    cancel_connect_timeout();
     conn_->close();
+    conn_->reset_after_close();
     if (on_connect_cb_) on_connect_cb_(false, 255);
+}
+
+inline void mqtt_client::cancel_connect_timeout() {
+    // Every other end of a connect attempt cancels it; one left pending is what
+    // let a superseded wait fire against a later connection.
+    asio::error_code ignored;
+    connect_timer_->cancel(ignored);
 }
 
 inline void mqtt_client::send_connect_packet() {
@@ -428,6 +472,13 @@ inline void mqtt_client::handle_connack(const std::vector<uint8_t>& data) {
     if (pkt.return_code == 0) {
         conn_->mark_connected();
         closed_ = false;
+        session_established_ = true;
+        // The accepted session is the only thing the connect timeout still has
+        // to watch: a refusal, a socket error or a timeout all cancel it when
+        // they end their attempt, but a socket the broker closes right after the
+        // CONNACK leaves nothing else to notice.  Left pending, this wait fires
+        // against whatever attempt comes next.
+        connect_timer_->cancel(asio::error_code());
     } else {
         // The broker refused the session (bad credentials, not authorized, ...).
         // Close the socket right away instead of leaving it to the next connect
@@ -435,7 +486,10 @@ inline void mqtt_client::handle_connack(const std::vector<uint8_t>& data) {
         // backoff window otherwise.  closed_ suppresses the close notification,
         // the reconnect is driven from the on_connect(false) callback below.
         closed_ = true;
+        // This attempt is over: a timeout left pending would fire against the next.
+        cancel_connect_timeout();
         conn_->close();
+        conn_->reset_after_close();
     }
     if (on_connect_cb_) on_connect_cb_(pkt.return_code == 0, pkt.return_code);
 }
@@ -820,6 +874,10 @@ inline void mqtt_client::async_subscribe_impl(const std::string& topic, uint8_t 
 inline void mqtt_client::on_connect(connect_cb callback) { on_connect_cb_ = std::move(callback); }
 inline void mqtt_client::on_message(message_cb callback) { on_message_cb_ = std::move(callback); }
 inline void mqtt_client::on_close(close_cb callback) { on_close_cb_ = std::move(callback); }
+
+inline void mqtt_client::on_disconnected(disconnected_cb callback) {
+    on_disconnected_cb_ = std::move(callback);
+}
 inline void mqtt_client::on_subscribe(subscribe_cb callback) { on_subscribe_cb_ = std::move(callback); }
 inline void mqtt_client::on_publish(publish_cb callback) { on_publish_cb_ = std::move(callback); }
 
@@ -1009,7 +1067,28 @@ inline void mqtt_client::finish_publish_failure(uint16_t packet_id) {
 
 inline void mqtt_client::notify_closed_once() {
     if (closed_) return;
+
+    // Decided before the teardown: cleanup_session() clears the flag.  Neither
+    // closed_ nor the connection state can answer this -- closed_ is also set by
+    // the timeout or by a failure during the handshake, and the state is already
+    // disconnected when a failed write or a protocol error surfaces.
+    const bool was_up = session_established_;
+
+    cleanup_session();
+    if (was_up) {
+        if (on_disconnected_cb_) on_disconnected_cb_();
+    } else if (on_close_cb_) {
+        on_close_cb_();
+    }
+}
+
+// The teardown.  conn_->close() can reach notify_closed_once() re-entrantly (it
+// completes a pending read or write, whose handler reports the failure again),
+// so closed_ is set before anything else runs and that inner call returns at its
+// first line.
+inline void mqtt_client::cleanup_session() {
     closed_ = true;
+    session_established_ = false;
 
     cancel_ping_timer();
     {
@@ -1051,7 +1130,6 @@ inline void mqtt_client::notify_closed_once() {
     pending_subscribes_.clear();
 
     conn_->close();
-    if (on_close_cb_) on_close_cb_();
 }
 
 }  // namespace litemqtt

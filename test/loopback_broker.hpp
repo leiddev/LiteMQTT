@@ -260,6 +260,11 @@ private:
                 return;
             }
             if (stopped_or_closed()) {
+                // close_client_connection() asked for the peer to go away, so shut
+                // the socket down as well: leaving the loop alone would leave the
+                // connection open and the client none the wiser.
+                asio::error_code ignored;
+                client_socket_.close(ignored);
                 return;
             }
             if (!read_one_frame(buffer, frame, /*blocking=*/false)) {

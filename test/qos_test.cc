@@ -126,7 +126,9 @@ TEST(ClientQos1, GivesUpAfterMaxRetransmits) {
     std::atomic<int> callbacks{0};
     std::atomic<bool> last_success{true};
     std::atomic<int> closes{0};
-    harness.client().on_close([&closes]() { ++closes; });
+    // The session is up by now, so its teardown is reported through
+    // on_disconnected(); on_close() only reports attempts that never came up.
+    harness.client().on_disconnected([&closes]() { ++closes; });
     harness.client().async_publish("t/giveup", "payload", 1,
         [&callbacks, &last_success](bool ok, std::string, uint8_t, uint16_t) {
             ++callbacks;
@@ -268,7 +270,7 @@ TEST(ClientQos2, PubrelRetransmitsAndGivesUp) {
     ASSERT_TRUE(harness.connect_and_wait());
 
     std::atomic<int> closes{0};
-    harness.client().on_close([&closes]() { ++closes; });
+    harness.client().on_disconnected([&closes]() { ++closes; });
     harness.client().async_publish("t/q2retry", "payload", 2);
 
     ASSERT_TRUE(wait_for([&broker]() { return frames_of_type(broker, 6).size() >= 2; }, 3000))

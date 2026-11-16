@@ -48,6 +48,9 @@ public:
 
     void mark_connected();
     void close();
+    /// Re-arms the object after close(), for a caller that closes the socket
+    /// itself and then starts a new attempt on the same connection.
+    void reset_after_close();
 
     void set_close_handler(close_handler handler) {
         close_handler_ = std::move(handler);
@@ -435,9 +438,25 @@ inline void connection::close() {
     // caller also has to hear about the failure rather than wait forever.
     fail_pending_writes(asio::error::operation_aborted);
 
+    // The read was abandoned in flight, so its completion -- the one that would
+    // reset this -- may never run.  Left at 1, async_read_packet() then does
+    // nothing for the next session started on this object: the transport comes up
+    // and never hears a CONNACK.
+    reading_depth_ = 0;
+    read_header_.clear();
+
     if (close_handler_) {
         close_handler_();
     }
+}
+
+/// Re-arms the object for another attempt.  close() leaves it unusable on purpose
+/// -- every write is failed rather than parked on a dead socket -- and only
+/// async_connect() clears that, which is too late for a caller that tears a
+/// socket down itself and then starts a new attempt on this same connection.
+inline void connection::reset_after_close() {
+    closed_ = false;
+    state_ = connection_state::disconnected;
 }
 
 }  // namespace litemqtt

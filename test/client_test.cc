@@ -231,7 +231,9 @@ TEST(MqttClientConnack, RefusedSessionReportsTheCodeAndStaysDisconnected) {
         connect_ok = ok;
         connect_rc = rc;
     });
+    int disconnects = 0;
     client->on_close([&closes]() { ++closes; });
+    client->on_disconnected([&disconnects]() { ++disconnects; });
 
     connack_packet refusal;
     refusal.return_code = 5;  // not authorized
@@ -245,6 +247,32 @@ TEST(MqttClientConnack, RefusedSessionReportsTheCodeAndStaysDisconnected) {
     // notification is suppressed so the reconnect policy is driven from one
     // place instead of two.
     EXPECT_EQ(closes, 0) << "a refused CONNACK must not also fire on_close";
+    EXPECT_EQ(disconnects, 0) << "nothing was established, so nothing disconnected";
+}
+
+// The other half of the split: once the session is up, its teardown belongs to
+// on_disconnected() and on_close() stays quiet.
+TEST(MqttClientConnack, ClosingAnEstablishedSessionReportsOnDisconnected) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+    client->set_log_handler([](const litemqtt::log_record&) {});
+
+    int closes = 0;
+    int disconnects = 0;
+    client->on_close([&closes]() { ++closes; });
+    client->on_disconnected([&disconnects]() { ++disconnects; });
+
+    connack_packet accept;
+    accept.return_code = 0;
+    client->handle_packet(accept.serialize());
+    ASSERT_EQ(client->state(), connection_state::connected);
+
+    // A protocol error on the established session: malformed inbound PUBLISH.
+    client->handle_publish({0x36, 0x04, 0x00, 0x01, 'a', 0x00, 0x01});
+
+    EXPECT_EQ(disconnects, 1);
+    EXPECT_EQ(closes, 0) << "an established session must not report on_close as well";
+    EXPECT_EQ(client->state(), connection_state::disconnected);
 }
 
 TEST(MqttClientConnack, AcceptedSessionMarksConnected) {
