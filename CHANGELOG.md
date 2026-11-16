@@ -9,9 +9,15 @@ replacing them.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-16
+
 Upgrading has one thing to look at: `mqtt_client::on_close` no longer fires for a
 connection that went away after it was established, so an application that only
 watched `on_close` to notice a dropped link no longer sees it.  See Changed.
+
+1.2.0 was tagged once before this and withdrawn the same day: that tree did not
+compile on GCC, and a session that dropped was never retried.  Both are fixed
+here; anything taken from the withdrawn tag should be replaced with this one.
 
 ### Added
 
@@ -241,6 +247,7 @@ First tagged release.
 - `reconnect_probe` and `reconnect_stress`, two loopback tools for exercising
   reconnection behaviour that unit tests cannot observe.
 
-[Unreleased]: https://github.com/leiddev/LiteMQTT/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/leiddev/LiteMQTT/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/leiddev/LiteMQTT/releases/tag/v1.2.0
 [1.1.0]: https://github.com/leiddev/LiteMQTT/releases/tag/v1.1.0
 [1.0.0]: https://github.com/leiddev/LiteMQTT/releases/tag/v1.0.0
