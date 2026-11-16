@@ -2,8 +2,8 @@
 //
 // Publishes at a steady rate while a local broker goes through the kinds of
 // trouble a real deployment sees -- outage, blackhole (socket accepted, nothing
-// comes back), flapping link, slow reader (backpressure) -- and checks the two
-// things that matter:
+// comes back), repeated short outages, slow reader (backpressure) -- and checks the
+// two things that matter:
 //
 //   * robustness: the helper keeps publishing, reconnects on its own and never
 //     gets stuck in a half-open session;
@@ -117,7 +117,6 @@ enum class link_state {
     up,         // accept, CONNACK, PUBACK
     down,       // not listening at all (connection refused)
     blackhole,  // accept and then stay silent: no CONNACK, no PUBACK
-    flap,       // normal, but every session is dropped after a short delay
     slow,       // normal, but reads are throttled (backpressure while publishing)
 };
 
@@ -126,7 +125,6 @@ const char* to_string(link_state s) {
     case link_state::up: return "up";
     case link_state::down: return "down";
     case link_state::blackhole: return "blackhole";
-    case link_state::flap: return "flap";
     case link_state::slow: return "slow";
     }
     return "?";
@@ -184,7 +182,6 @@ public:
     int pubacks() const { return pubacks_.load(); }
     int framing_errors() const { return framing_errors_.load(); }
     int ordering_errors() const { return ordering_errors_.load(); }
-    int resets() const { return resets_.load(); }
     int held_blackholes() const { return held_.load(); }
     link_state state_snapshot() const { return state_.load(); }
     // Set when the broker lost the port mid-run: every counter from then on describes
@@ -300,19 +297,6 @@ private:
         if (state_.load() == link_state::blackhole) {
             ++held_;  // accept and never say a word
             return;
-        }
-        if (state_.load() == link_state::flap) {
-            auto weak = std::weak_ptr<session>(s);
-            s->timer.expires_after(milliseconds(80));
-            s->timer.async_wait([this, weak](const asio::error_code& ec) {
-                if (ec) return;
-                auto self = weak.lock();
-                if (!self) return;
-                asio::error_code ignored;
-                self->sock.close(ignored);
-                ++resets_;
-                forget(self);
-            });
         }
         read_loop(s);
     }
@@ -494,7 +478,6 @@ private:
     std::atomic<int> pubacks_{0};
     std::atomic<int> framing_errors_{0};
     std::atomic<int> ordering_errors_{0};
-    std::atomic<int> resets_{0};
     std::atomic<int> held_{0};
 };
 
@@ -548,7 +531,7 @@ void print_usage() {
         "                        [--rss-limit-mb N] [--port N]\n"
         "\n"
         "scenarios (all publish continuously while the link misbehaves):\n"
-        "  flap      short outages, ~0.5 s up / ~0.5 s down\n"
+        "  flap      short outages: ~0.5 s reachable, ~0.5 s refused\n"
         "  long      long outages: 10 s up, 15 s down\n"
         "  blackhole accepted sockets that never answer\n"
         "  weak      always reachable but the broker reads slowly (backpressure)\n"
@@ -577,6 +560,8 @@ struct schedule_step {
 std::vector<schedule_step> build_schedule(const std::string& name) {
     std::vector<schedule_step> s;
     if (name == "flap") {
+        // Short outages: the listener goes away and comes back before the
+        // reconnect backoff has settled, so every retry lands mid-cycle.
         for (int i = 0; i < 120; ++i) {
             s.push_back({link_state::up, 500});
             s.push_back({link_state::down, 500});
@@ -603,8 +588,6 @@ std::vector<schedule_step> build_schedule(const std::string& name) {
         for (int i = 0; i < 200; ++i) {
             s.push_back({link_state::up, 4000});
             s.push_back({link_state::down, 3000});
-            s.push_back({link_state::up, 2000});
-            s.push_back({link_state::flap, 2000});
             s.push_back({link_state::up, 2000});
             s.push_back({link_state::blackhole, 3000});
             s.push_back({link_state::up, 2000});
@@ -676,7 +659,6 @@ int main(int argc, char** argv) {
     int b_pubacks = 0;
     int b_framing_errors = 0;
     int b_ordering_errors = 0;
-    int b_resets = 0;
     int b_held = 0;
     std::size_t still_pending = 0;
     long long stop_ms = 0;
@@ -808,7 +790,6 @@ int main(int argc, char** argv) {
         b_pubacks = broker->pubacks();
         b_framing_errors = broker->framing_errors();
         b_ordering_errors = broker->ordering_errors();
-        b_resets = broker->resets();
         b_held = broker->held_blackholes();
     }
 
@@ -820,8 +801,8 @@ int main(int argc, char** argv) {
     const long rss_after = rss_kb();
 
     std::printf("\n---- summary (%s, %ds) ----\n", opt.scenario.c_str(), opt.duration_s);
-    std::printf("sessions      : %d accepted, %d CONNACKed, %d reset by broker, %d blackholed\n",
-                b_accepted, b_connacks, b_resets, b_held);
+    std::printf("sessions      : %d accepted, %d CONNACKed, %d blackholed\n",
+                b_accepted, b_connacks, b_held);
     std::printf("publish       : %lld issued, %lld ok, %lld failed, %zu pending at end, "
                 "%lld double-reported\n",
                 stats.issued, stats.succeeded, stats.failed, still_pending, stats.duplicates);
