@@ -127,7 +127,8 @@ private:
     void finish_publish_success(uint16_t packet_id);
     void finish_publish_failure(uint16_t packet_id);
     void cleanup_session();
-    void notify_closed_once();
+    void notify_closed_once(const std::string& reason = "connection closed",
+                            const asio::error_code& ec = asio::error_code());
 
 public:
     // Test hooks (do not use in production code).
@@ -252,6 +253,7 @@ private:
     /// loss of a session, or the end of an attempt that never came up.
     bool session_established_ = false;
     bool closed_ = false;
+    bool intentional_close_ = false;
 
     detail::log_channel log_channel_;
 };
@@ -308,6 +310,7 @@ inline void mqtt_client::async_connect(const std::string& host, uint16_t port, c
     // A new attempt starts clean: closed_ is what the previous failure left behind,
     // and the timeout handler *and* the connect completion both consult it.
     closed_ = false;
+    intentional_close_ = false;
 
     // Covers both halves of the attempt: the TCP connect and the CONNACK wait.
     // A peer that blackholes the SYN, or accepts the socket and then says nothing,
@@ -395,7 +398,7 @@ inline void mqtt_client::send_connect_packet() {
             // The broker accepted the socket and dropped it, or the stream broke:
             // without this the session would sit there waiting for a CONNACK that
             // can never arrive.
-            notify_closed_once();
+            notify_closed_once("CONNECT write failed", ec);
             return;
         }
         schedule_pingreq();
@@ -408,7 +411,12 @@ inline void mqtt_client::start_read_loop() {
     conn_->async_read_packet(
         [this, self](const asio::error_code& ec, const std::vector<uint8_t>& data) {
             if (ec) {
-                notify_closed_once();
+                const char* reason = ec == asio::error::eof ? "peer TCP EOF"
+                    : ec == asio::error::connection_reset ? "peer TCP reset"
+                    : ec == asio::error::invalid_argument ? "invalid MQTT packet type"
+                    : ec == asio::error::message_size ? "MQTT packet length invalid or exceeds limit"
+                    : "TCP read failed";
+                notify_closed_once(reason, ec);
                 return;
             }
             handle_packet(data);
@@ -466,7 +474,7 @@ inline void mqtt_client::handle_connack(const std::vector<uint8_t>& data) {
     if (!connack_packet::parse(data, pkt)) {
         LITEMQTT_LOG_TO(log_channel_, log_level::error)
             << "Protocol error: malformed CONNACK";
-        notify_closed_once();
+        notify_closed_once("malformed CONNACK");
         return;
     }
     if (pkt.return_code == 0) {
@@ -499,7 +507,7 @@ inline void mqtt_client::handle_publish(const std::vector<uint8_t>& data) {
     if (!publish_packet::parse(data, pkt)) {
         LITEMQTT_LOG_TO(log_channel_, log_level::error)
             << "Protocol error: malformed PUBLISH";
-        notify_closed_once();
+        notify_closed_once("malformed PUBLISH");
         return;
     }
 
@@ -692,14 +700,14 @@ inline void mqtt_client::schedule_pingreq() {
 
         conn_->async_write_packet(data, [this, self](const asio::error_code& write_ec) {
             if (write_ec) {
-                notify_closed_once();
+                notify_closed_once("PINGREQ write failed", write_ec);
                 return;
             }
 
             ping_timer_->expires_after(std::chrono::seconds(keep_alive_seconds_ / 2));
             ping_timer_->async_wait([this, self](const asio::error_code& timer_ec) {
                 if (timer_ec) return;
-                notify_closed_once();
+                notify_closed_once("PINGRESP timeout");
             });
         });
     });
@@ -711,11 +719,20 @@ inline void mqtt_client::cancel_ping_timer() {
 }
 
 inline void mqtt_client::async_disconnect(std::function<void()> on_closed) {
+    intentional_close_ = true;
     cancel_ping_timer();
     disconnect_packet pkt;
     auto self = shared_from_this();
     conn_->async_write_packet(pkt.serialize(), [this, self, on_closed = std::move(on_closed)](
-                                                   const asio::error_code&) {
+                                                   const asio::error_code& ec) {
+        if (ec) {
+            LITEMQTT_LOG_TO(log_channel_, log_level::warn)
+                << "client async_disconnect DISCONNECT write failed: value=" << ec.value()
+                << ", category=" << ec.category().name() << ", message=" << ec.message();
+        } else {
+            LITEMQTT_LOG_TO(log_channel_, log_level::warn)
+                << "client async_disconnect requested; DISCONNECT sent";
+        }
         conn_->close();
         if (on_closed) {
             on_closed();
@@ -724,9 +741,10 @@ inline void mqtt_client::async_disconnect(std::function<void()> on_closed) {
 }
 
 inline void mqtt_client::close() {
-    // conn_->close() invokes the close handler, which in turn calls
-    // notify_closed_once(): the session is marked closed, the ping timer stops
-    // and the pending publishes are failed.
+    if (!closed_ && !intentional_close_ && conn_->state() != connection_state::disconnected) {
+        LITEMQTT_LOG_TO(log_channel_, log_level::warn) << "client close requested (intentional)";
+    }
+    intentional_close_ = true;
     conn_->close();
 }
 
@@ -1064,8 +1082,16 @@ inline void mqtt_client::finish_publish_failure(uint16_t packet_id) {
     notify_closed_once();
 }
 
-inline void mqtt_client::notify_closed_once() {
+inline void mqtt_client::notify_closed_once(const std::string& reason, const asio::error_code& ec) {
     if (closed_) return;
+
+    if (!intentional_close_) {
+        LITEMQTT_LOG_TO(log_channel_, log_level::warn)
+            << "connection disconnected: " << reason
+            << (ec ? (std::string("; value=") + std::to_string(ec.value())
+                     + ", category=" + ec.category().name() + ", message=" + ec.message())
+                   : std::string());
+    }
 
     // Decided before the teardown: cleanup_session() clears the flag.  Neither
     // closed_ nor the connection state can answer this -- closed_ is also set by

@@ -227,4 +227,51 @@ TEST_F(log_test, HelperExposesPerInstanceHandlerAndForwardsToClient) {
     EXPECT_FALSE(helper->has_log_handler());
 }
 
+TEST_F(log_test, MalformedPacketWarnsOnceWithPacketReason) {
+    asio::io_context io;
+    std::vector<log_record> records;
+    auto client = std::make_shared<mqtt_client>(io);
+    client->set_log_handler([&](const log_record& r) {
+        if (r.level == log_level::warn) records.push_back(r);
+    });
+    client->handle_packet({0x20, 0x02, 0x00, 0x00});
+    client->handle_publish({0x30, 0x01, 0x00});
+    client->handle_publish({0x30, 0x01, 0x00});
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_NE(records[0].message.find("malformed PUBLISH"), std::string::npos);
+}
+
+TEST_F(log_test, IntentionalCloseSuppressesLaterTeardownWarnings) {
+    asio::io_context io;
+    std::vector<log_record> records;
+    auto client = std::make_shared<mqtt_client>(io);
+    client->set_log_handler([&](const log_record& r) {
+        if (r.level == log_level::warn) records.push_back(r);
+    });
+    client->handle_packet({0x20, 0x02, 0x00, 0x00});
+    client->close();
+    client->close();
+    client->handle_publish({0x30, 0x01, 0x00});
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_NE(records[0].message.find("client close requested (intentional)"), std::string::npos);
+}
+
+TEST_F(log_test, AsyncDisconnectWriteFailureIncludesErrorDetails) {
+    asio::io_context io;
+    std::vector<log_record> records;
+    auto client = std::make_shared<mqtt_client>(io);
+    client->set_log_handler([&](const log_record& r) { records.push_back(r); });
+    bool completed = false;
+    client->async_disconnect([&]() { completed = true; });
+    io.run();
+    EXPECT_TRUE(completed);
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_EQ(records[0].level, log_level::warn);
+    const asio::error_code ec = asio::error::bad_descriptor;
+    EXPECT_NE(records[0].message.find("DISCONNECT write failed"), std::string::npos);
+    EXPECT_NE(records[0].message.find("value=" + std::to_string(ec.value())), std::string::npos);
+    EXPECT_NE(records[0].message.find(std::string("category=") + ec.category().name()), std::string::npos);
+    EXPECT_NE(records[0].message.find("message=" + ec.message()), std::string::npos);
+}
+
 }  // namespace
