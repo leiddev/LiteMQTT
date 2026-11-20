@@ -8,6 +8,7 @@
 #include "litemqtt/client.hpp"
 #include "litemqtt/packets.hpp"
 #include "litemqtt/packet_type.hpp"
+#include "loopback_broker.hpp"
 
 namespace {
 
@@ -506,6 +507,281 @@ TEST(MqttClientInbound, TruncatedPublishIsAProtocolError) {
 
     EXPECT_EQ(messages, 0);
     EXPECT_EQ(closes, 1);
+}
+
+// Keep the client on the test thread so callbacks and assertions need no locks.
+class MqttClientUnsubscribe : public ::testing::Test {
+protected:
+    asio::io_context io;
+    litemqtt_test::loopback_broker broker;
+    std::shared_ptr<mqtt_client> client = make_test_client(io);
+    int disconnects = 0;
+
+    bool pump_until(const std::function<bool()>& done) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!done() && std::chrono::steady_clock::now() < deadline) {
+            io.restart();
+            io.run_for(std::chrono::milliseconds(5));
+        }
+        return done();
+    }
+
+    void SetUp() override {
+        client->set_keep_alive(0);
+        client->set_log_handler([](const log_record&) {});
+        client->on_disconnected([this]() { ++disconnects; });
+        client->async_connect("127.0.0.1", broker.port());
+        ASSERT_TRUE(pump_until([this]() { return client->state() == connection_state::connected; }));
+    }
+
+    void TearDown() override {
+        client->on_disconnected(nullptr);
+        client->close();
+        io.restart();
+        io.poll();
+        broker.stop();
+    }
+
+    std::vector<std::vector<uint8_t>> frames(uint8_t header) {
+        std::vector<std::vector<uint8_t>> result;
+        for (const auto& frame : broker.received()) {
+            if (frame[0] == header) result.push_back(frame);
+        }
+        return result;
+    }
+
+    void ack(uint16_t pid) {
+        unsuback_packet pkt;
+        pkt.packet_id = pid;
+        broker.reply(pkt.serialize());
+    }
+};
+
+TEST_F(MqttClientUnsubscribe, WireFormatWaitsForAckAndIgnoresDuplicates) {
+    int calls = 0;
+    client->debug_set_next_packet_id(42);
+    client->async_unsubscribe("a/+", [&](bool ok, std::string topic) {
+        ++calls;
+        EXPECT_TRUE(ok);
+        EXPECT_EQ(topic, "a/+");
+        // The entry must already be gone, even during the callback.
+        client->debug_set_next_packet_id(42);
+        EXPECT_EQ(client->acquire_packet_id_for_test(), 42);
+        client->handle_packet({0xB0, 2, 0, 42});
+    });
+    EXPECT_EQ(calls, 0);
+    ASSERT_TRUE(pump_until([&]() { return frames(0xA2).size() == 1; }));
+    EXPECT_EQ(frames(0xA2)[0], (std::vector<uint8_t>{0xA2, 7, 0, 42, 0, 3, 'a', '/', '+'}));
+    EXPECT_EQ(calls, 0);
+    // An unrelated ACK must not complete the request either.
+    ack(43);
+    broker.reply(litemqtt_test::make_raw_publish("barrier", "before"));
+    int barriers = 0;
+    client->on_message([&](std::string, std::string, uint8_t, uint16_t) { ++barriers; });
+    ASSERT_TRUE(pump_until([&]() { return barriers == 1; }));
+    EXPECT_EQ(calls, 0);
+    ack(42);
+    ack(42);
+    broker.reply(litemqtt_test::make_raw_publish("barrier", "after"));
+    ASSERT_TRUE(pump_until([&]() { return barriers == 2; }));
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(disconnects, 0);
+}
+
+TEST_F(MqttClientUnsubscribe, DefaultCallbackAndMaximumTopicLength) {
+    const std::string topic(65535, 'a');
+    int defaults = 0;
+    int explicit_calls = 0;
+    client->on_unsubscribe([&](bool ok, std::string returned) {
+        ++defaults;
+        EXPECT_TRUE(ok);
+        EXPECT_EQ(returned, topic);
+    });
+    client->async_unsubscribe(topic);
+    client->async_unsubscribe("explicit", [&](bool ok, std::string returned) {
+        ++explicit_calls;
+        EXPECT_TRUE(ok);
+        EXPECT_EQ(returned, "explicit");
+    });
+    ASSERT_TRUE(pump_until([&]() { return frames(0xA2).size() == 2; }));
+    auto sent = frames(0xA2);
+    buffer_reader reader(sent[0]);
+    uint8_t header = 0;
+    std::size_t length = 0;
+    uint16_t pid = 0;
+    std::string filter;
+    ASSERT_TRUE(reader.read_uint8(header));
+    ASSERT_TRUE(reader.read_remaining_length(length));
+    ASSERT_TRUE(reader.read_uint16(pid));
+    ASSERT_TRUE(reader.read_string(filter));
+    EXPECT_EQ(length, 65539u);
+    EXPECT_EQ(filter, topic);
+    EXPECT_EQ(reader.remaining(), 0u);
+    EXPECT_EQ(defaults, 0);
+    EXPECT_EQ(explicit_calls, 0);
+    ack(pid);
+    ack(litemqtt_test::frame_packet_id(sent[1]));
+    ASSERT_TRUE(pump_until([&]() { return defaults == 1 && explicit_calls == 1; }));
+    client->on_unsubscribe(nullptr);
+}
+
+TEST_F(MqttClientUnsubscribe, PeerDisconnectFailsAllPendingOnceBeforeReentry) {
+    int calls = 0;
+    for (int i = 0; i < 2; ++i) {
+        client->async_unsubscribe("pending", [&](bool ok, std::string topic) {
+            ++calls;
+            EXPECT_FALSE(ok);
+            EXPECT_EQ(topic, "pending");
+            // Neither pending request may be completed by a reentrant ACK.
+            client->handle_packet({0xB0, 2, 0, 1});
+            client->handle_packet({0xB0, 2, 0, 2});
+        });
+    }
+    ASSERT_TRUE(pump_until([&]() { return frames(0xA2).size() == 2; }));
+    EXPECT_EQ(calls, 0);
+    broker.close_client_connection();
+    ASSERT_TRUE(pump_until([&]() { return disconnects == 1; }));
+    EXPECT_EQ(calls, 2);
+    client->close();
+    io.poll();
+    EXPECT_EQ(calls, 2);
+}
+
+TEST_F(MqttClientUnsubscribe, CloseWithStoppedIoFailsPendingSynchronously) {
+    int calls = 0;
+    client->async_unsubscribe("pending", [&](bool ok, std::string) {
+        ++calls;
+        EXPECT_FALSE(ok);
+        client->close();
+    });
+    ASSERT_TRUE(pump_until([&]() { return frames(0xA2).size() == 1; }));
+    io.stop();
+    client->close();
+    EXPECT_EQ(calls, 1);
+    io.restart();
+    io.poll();
+    EXPECT_EQ(calls, 1);
+}
+
+TEST_F(MqttClientUnsubscribe, GracefulDisconnectFailsPendingBeforeOnClosedStopsIo) {
+    int calls = 0;
+    bool closed = false;
+    client->async_unsubscribe("pending", [&](bool ok, std::string) {
+        ++calls;
+        EXPECT_FALSE(ok);
+    });
+    ASSERT_TRUE(pump_until([&]() { return frames(0xA2).size() == 1; }));
+    client->async_disconnect([&]() {
+        EXPECT_EQ(calls, 1);
+        closed = true;
+        io.stop();
+    });
+    ASSERT_TRUE(pump_until([&]() { return closed; }));
+    EXPECT_EQ(calls, 1);
+    io.restart();
+    io.poll();
+    EXPECT_EQ(calls, 1);
+}
+
+TEST_F(MqttClientUnsubscribe, PacketIdsAreSharedWithSubscribePublishAndPubrel) {
+    client->debug_set_next_packet_id(1);
+    client->async_publish("p", "v", 2);
+    ASSERT_TRUE(pump_until([&]() { return frames(0x34).size() == 1; }));
+    EXPECT_EQ(litemqtt_test::publish_packet_id(frames(0x34)[0]), 1);
+    broker.reply({0x50, 2, 0, 1});
+    ASSERT_TRUE(pump_until([&]() { return frames(0x62).size() == 1; }));
+    client->debug_set_next_packet_id(1);
+    client->async_subscribe("s");
+    ASSERT_TRUE(pump_until([&]() { return frames(0x82).size() == 1; }));
+    EXPECT_EQ(litemqtt_test::frame_packet_id(frames(0x82)[0]), 2);
+    client->debug_set_next_packet_id(1);
+    client->async_publish("p", "v", 1);
+    ASSERT_TRUE(pump_until([&]() { return frames(0x32).size() == 1; }));
+    EXPECT_EQ(litemqtt_test::publish_packet_id(frames(0x32)[0]), 3);
+    client->debug_set_next_packet_id(1);
+    client->async_unsubscribe("u");
+    ASSERT_TRUE(pump_until([&]() { return frames(0xA2).size() == 1; }));
+    EXPECT_EQ(litemqtt_test::frame_packet_id(frames(0xA2)[0]), 4);
+    client->debug_set_next_packet_id(4);
+    client->async_subscribe("s2");
+    ASSERT_TRUE(pump_until([&]() { return frames(0x82).size() == 2; }));
+    EXPECT_EQ(litemqtt_test::frame_packet_id(frames(0x82)[1]), 5);
+    client->debug_set_next_packet_id(4);
+    client->async_publish("p2", "v", 1);
+    ASSERT_TRUE(pump_until([&]() { return frames(0x32).size() == 2; }));
+    EXPECT_EQ(litemqtt_test::publish_packet_id(frames(0x32)[1]), 6);
+}
+
+TEST_F(MqttClientUnsubscribe, InvalidTopicsFailWithoutSendingOrClosing) {
+    int calls = 0;
+    for (const auto& topic : {std::string(), std::string(65536, 'a')}) {
+        client->async_unsubscribe(topic, [&, topic](bool ok, std::string returned) {
+            ++calls;
+            EXPECT_FALSE(ok);
+            EXPECT_EQ(returned, topic);
+        });
+    }
+    EXPECT_EQ(calls, 0);
+    ASSERT_TRUE(pump_until([&]() { return calls == 2; }));
+    EXPECT_TRUE(frames(0xA2).empty());
+    EXPECT_EQ(client->state(), connection_state::connected);
+}
+
+class MqttClientMalformedUnsuback : public MqttClientUnsubscribe,
+                                   public ::testing::WithParamInterface<std::vector<uint8_t>> {};
+
+TEST_P(MqttClientMalformedUnsuback, ClosesAndFailsPendingOnce) {
+    int calls = 0;
+    client->async_unsubscribe("pending", [&](bool ok, std::string) {
+        ++calls;
+        EXPECT_FALSE(ok);
+    });
+    ASSERT_TRUE(pump_until([&]() { return frames(0xA2).size() == 1; }));
+    broker.reply(GetParam());
+    ASSERT_TRUE(pump_until([&]() { return disconnects == 1; }));
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(client->state(), connection_state::disconnected);
+}
+
+INSTANTIATE_TEST_SUITE_P(InvalidFrames, MqttClientMalformedUnsuback, ::testing::Values(
+    std::vector<uint8_t>{0xB1, 2, 0, 1},
+    std::vector<uint8_t>{0xB0, 1, 1},
+    std::vector<uint8_t>{0xB0, 3, 0, 1, 0},
+    std::vector<uint8_t>{0xB0, 2, 0, 0}));
+
+TEST(MqttClientUnsubscribeGuards, NoSessionFailsAsynchronouslyUsingDefaultCallback) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+    int calls = 0;
+    client->on_unsubscribe([&](bool ok, std::string topic) {
+        ++calls;
+        EXPECT_FALSE(ok);
+        EXPECT_EQ(topic, "offline");
+    });
+    client->async_unsubscribe("offline");
+    EXPECT_EQ(calls, 0);
+    io.run();
+    EXPECT_EQ(calls, 1);
+}
+
+TEST(MqttClientUnsubscribeGuards, WriteFailureErasesBeforeCallbackAndFailsOnce) {
+    asio::io_context io;
+    auto client = make_test_client(io);
+    // An accepted CONNACK without a socket deterministically exercises write failure.
+    client->handle_packet({0x20, 2, 0, 0});
+    int calls = 0;
+    client->async_unsubscribe("write-failure", [&](bool ok, std::string topic) {
+        ++calls;
+        EXPECT_FALSE(ok);
+        EXPECT_EQ(topic, "write-failure");
+        client->debug_set_next_packet_id(1);
+        EXPECT_EQ(client->acquire_packet_id_for_test(), 1);
+        client->handle_packet({0xB0, 2, 0, 1});
+    });
+    io.run();
+    EXPECT_EQ(calls, 1);
+    client->handle_packet({0xB1, 2, 0, 1});
+    EXPECT_EQ(calls, 1);
 }
 
 }  // namespace

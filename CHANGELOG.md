@@ -9,6 +9,36 @@ replacing them.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-20
+
+### Added
+
+- **`mqtt_client::async_unsubscribe()`.** Removes one topic filter from the
+  broker's subscriptions. The callback (`unsubscribe_cb`: `bool success,
+  std::string topic`) completes only when the broker's UNSUBACK arrives; a failed
+  write, or a session lost while waiting, reports failure instead. Every request
+  is completed exactly once. `on_unsubscribe()` installs a default callback for
+  calls that pass none. An empty topic, or one longer than 65535 bytes, fails
+  without sending anything. The removal is dropped from the pending table before
+  the callback runs, so the callback may reuse the packet identifier.
+
+- **`mqtt_helper::unsubscribe()`.** Removes every exact match of the topic filter
+  from the list replayed on reconnect, then unsubscribes on the current session.
+  It works offline too: the local entries are removed and the callback runs
+  synchronously with `false`, since no broker has confirmed anything. No
+  UNSUBSCRIBE is queued for the next session, so with `clean_session = false` a
+  removed filter has to be unsubscribed again once connected.
+
+- `subscribe()`, `unsubscribe()` and the reconnect replay now commit under one
+  lock, so subscribe/unsubscribe/subscribe on one topic reaches the broker, and
+  the replay list, in call order.
+
+### Fixed
+
+- `mqtt_helper::unsubscribe()` is a no-op once `stop()` was called, even from a
+  callback still running on the io thread, instead of queuing a request the
+  stopping io thread would never send.
+
 ## [1.2.0] - 2026-11-16
 
 Upgrading has one thing to look at: `mqtt_client::on_close` no longer fires for a

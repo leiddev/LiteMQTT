@@ -38,6 +38,175 @@ std::shared_ptr<litemqtt::mqtt_helper> make_helper(const std::string& id) {
     return helper;
 }
 
+/// Extracts the first topic filter from a SUBSCRIBE or UNSUBSCRIBE frame.
+std::string mqtt_filter(const std::vector<uint8_t>& frame) {
+    std::size_t index = 1;
+    while (index < frame.size() && (frame[index] & 0x80) != 0) {
+        ++index;
+    }
+    if (index >= frame.size()) {
+        return {};
+    }
+    ++index;  // body starts after the remaining-length field
+    if (index + 4 > frame.size()) {
+        return {};
+    }
+    index += 2;  // packet identifier
+    const std::size_t length = (static_cast<std::size_t>(frame[index]) << 8) |
+                               frame[index + 1];
+    index += 2;
+    if (index + length > frame.size()) {
+        return {};
+    }
+    return std::string(frame.begin() + index, frame.begin() + index + length);
+}
+
+/// A small multi-session peer for checking that stop()/start() replays the
+/// current subscription list, rather than the list from the previous session.
+class multi_connection_broker {
+public:
+    using tcp = asio::ip::tcp;
+    using frame_record = std::pair<std::size_t, std::vector<uint8_t>>;
+
+    multi_connection_broker()
+        : acceptor_(io_, tcp::endpoint(tcp::v4(), 0)), port_(acceptor_.local_endpoint().port()) {
+        acceptor_.non_blocking(true);
+        thread_ = std::thread([this]() { serve(); });
+    }
+
+    ~multi_connection_broker() { stop(); }
+
+    uint16_t port() const { return port_; }
+
+    std::size_t connection_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return connection_count_;
+    }
+
+    std::vector<std::vector<uint8_t>> received_for(std::size_t connection) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::vector<uint8_t>> result;
+        for (const auto& record : received_) {
+            if (record.first == connection) {
+                result.push_back(record.second);
+            }
+        }
+        return result;
+    }
+
+    void stop() {
+        if (stopped_.exchange(true)) {
+            return;
+        }
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+private:
+    bool read_frame(tcp::socket& socket, std::vector<uint8_t>& buffer,
+                    std::vector<uint8_t>& frame) {
+        while (!stopped_.load()) {
+            if (litemqtt_test::take_frame(buffer, frame)) {
+                return true;
+            }
+            char bytes[512];
+            asio::error_code ec;
+            const std::size_t count = socket.read_some(asio::buffer(bytes), ec);
+            if (ec == asio::error::would_block || ec == asio::error::try_again) {
+                std::this_thread::sleep_for(milliseconds(1));
+                continue;
+            }
+            if (ec) return false;
+            buffer.insert(buffer.end(), bytes, bytes + count);
+        }
+        return false;
+    }
+
+    bool write_frame(tcp::socket& socket, const std::vector<uint8_t>& frame) {
+        std::size_t sent = 0;
+        while (sent < frame.size() && !stopped_.load()) {
+            asio::error_code ec;
+            sent += socket.write_some(asio::buffer(frame.data() + sent, frame.size() - sent), ec);
+            if (ec == asio::error::would_block || ec == asio::error::try_again) {
+                std::this_thread::sleep_for(milliseconds(1));
+                continue;
+            }
+            if (ec) return false;
+        }
+        return sent == frame.size();
+    }
+
+    void record(std::size_t connection, const std::vector<uint8_t>& frame) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        received_.emplace_back(connection, frame);
+    }
+
+    void serve() {
+        while (!stopped_.load()) {
+            auto socket = std::make_shared<tcp::socket>(io_);
+            asio::error_code ec;
+            acceptor_.accept(*socket, ec);
+            if (ec == asio::error::would_block || ec == asio::error::try_again) {
+                std::this_thread::sleep_for(milliseconds(1));
+                continue;
+            }
+            if (ec) return;
+            socket->non_blocking(true);
+
+            std::size_t connection;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                connection = ++connection_count_;
+            }
+
+            std::vector<uint8_t> buffer;
+            std::vector<uint8_t> frame;
+            if (read_frame(*socket, buffer, frame)) {
+                record(connection, frame);
+                if (!write_frame(*socket, {0x20, 0x02, 0x00, 0x00})) {
+                    frame.clear();
+                } else {
+                    while (read_frame(*socket, buffer, frame)) {
+                        record(connection, frame);
+                        if (frame.empty()) {
+                            continue;
+                        }
+                        const uint8_t type = static_cast<uint8_t>(frame[0] >> 4);
+                        const uint16_t packet_id = litemqtt_test::frame_packet_id(frame);
+                        if (type == 8 && packet_id != 0) {  // SUBSCRIBE
+                            if (!write_frame(*socket, {0x90, 0x03,
+                                    static_cast<uint8_t>(packet_id >> 8),
+                                    static_cast<uint8_t>(packet_id & 0xff), 0x01})) {
+                                break;
+                            }
+                        } else if (type == 10 && packet_id != 0) {  // UNSUBSCRIBE
+                            if (!write_frame(*socket, {0xb0, 0x02,
+                                    static_cast<uint8_t>(packet_id >> 8),
+                                    static_cast<uint8_t>(packet_id & 0xff)})) {
+                                break;
+                            }
+                        } else if (type == 14) {  // DISCONNECT
+                            break;
+                        }
+                    }
+                }
+            }
+
+            socket->close(ec);
+        }
+    }
+
+    asio::io_context io_;
+    tcp::acceptor acceptor_;
+    uint16_t port_;
+    std::thread thread_;
+    mutable std::mutex mutex_;
+    std::vector<frame_record> received_;
+    std::size_t connection_count_ = 0;
+    std::atomic<bool> stopped_{false};
+};
+
 }  // namespace
 
 // The helper owns the client, and the client's callbacks used to hold a
@@ -685,4 +854,199 @@ TEST(MqttHelperEvents, NoEventsAfterStop) {
     // The counter keeps what it counted; it is what the application compares
     // against after a restart.
     EXPECT_EQ(helper->connected_count(), 1u);
+}
+
+// Online unsubscribe completes only after the broker's UNSUBACK, and its
+// callback can safely enqueue another helper operation.
+TEST(MqttHelperUnsubscribe, OnlineCallbackWaitsForUnsubackAndCanReenter) {
+    loopback_broker broker;
+    auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", broker.port(),
+                                                          "unsubscribe-online-ack");
+    helper->set_log_handler([](const litemqtt::log_record&) {});
+    helper->set_reconnect_config(0, 10);
+    helper->start();
+    ASSERT_TRUE(wait_for([&helper]() { return helper->is_connected(); }, 3000));
+
+    std::atomic<bool> callback_called{false};
+    std::atomic<bool> callback_success{false};
+    std::atomic<bool> callback_topic_matches{false};
+    helper->unsubscribe("online/topic", [&](bool success, std::string topic) {
+        callback_success.store(success);
+        callback_topic_matches.store(topic == "online/topic");
+        helper->subscribe("callback/reentered", 1);
+        callback_called.store(true);
+    });
+
+    ASSERT_TRUE(wait_for([&broker]() {
+        const auto frames = broker.received();
+        return std::any_of(frames.begin(), frames.end(), [](const std::vector<uint8_t>& frame) {
+            return !frame.empty() && (frame[0] >> 4) == 10 &&
+                   mqtt_filter(frame) == "online/topic";
+        });
+    }, 3000)) << "the online UNSUBSCRIBE was not sent";
+    EXPECT_FALSE(callback_called.load()) << "unsubscribe callback ran before UNSUBACK";
+
+    uint16_t packet_id = 0;
+    for (const auto& frame : broker.received()) {
+        if (!frame.empty() && (frame[0] >> 4) == 10 &&
+            mqtt_filter(frame) == "online/topic") {
+            packet_id = litemqtt_test::frame_packet_id(frame);
+            break;
+        }
+    }
+    ASSERT_NE(packet_id, 0u);
+    broker.reply({0xb0, 0x02, static_cast<uint8_t>(packet_id >> 8),
+                  static_cast<uint8_t>(packet_id & 0xff)});
+
+    ASSERT_TRUE(wait_for([&callback_called]() { return callback_called.load(); }, 3000))
+        << "the callback was not delivered after UNSUBACK";
+    EXPECT_TRUE(callback_success.load());
+    EXPECT_TRUE(callback_topic_matches.load());
+    helper->stop();
+}
+
+// Offline unsubscribe is synchronous, removes every exact duplicate, preserves
+// other filters, and invokes user code outside the subscription lock.
+TEST(MqttHelperUnsubscribe, OfflineRemovesDuplicatesAndRetainsOtherFilters) {
+    multi_connection_broker broker;
+    auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", broker.port(),
+                                                          "unsubscribe-offline");
+    helper->set_log_handler([](const litemqtt::log_record&) {});
+    helper->set_reconnect_config(0, 10);
+    helper->subscribe("sensors/+/temp", 0);
+    helper->subscribe("sensors/+/temp", 1);
+    helper->subscribe("sensors/kitchen/temp", 1);
+
+    bool callback_called = false;
+    bool callback_success = true;
+    bool callback_topic_matches = false;
+    helper->unsubscribe("sensors/+/temp", [&](bool success, std::string topic) {
+        callback_called = true;
+        callback_success = success;
+        callback_topic_matches = topic == "sensors/+/temp";
+        // Re-entering subscribe from the synchronous offline callback must not
+        // deadlock; this new filter should also be replayed on connect.
+        helper->subscribe("callback/retained", 1);
+    });
+    EXPECT_TRUE(callback_called) << "offline callback should be synchronous";
+    EXPECT_FALSE(callback_success);
+    EXPECT_TRUE(callback_topic_matches);
+
+    helper->start();
+    ASSERT_TRUE(wait_for([&helper]() { return helper->is_connected(); }, 3000));
+    ASSERT_TRUE(wait_for([&broker]() { return broker.received_for(1).size() >= 3; }, 3000));
+
+    std::vector<std::string> replayed;
+    for (const auto& frame : broker.received_for(1)) {
+        if (!frame.empty() && (frame[0] >> 4) == 8) {
+            replayed.push_back(mqtt_filter(frame));
+        }
+    }
+    ASSERT_EQ(replayed.size(), 2u);
+    EXPECT_EQ(replayed[0], "sensors/kitchen/temp");
+    EXPECT_EQ(replayed[1], "callback/retained");
+    helper->stop();
+}
+
+// A topic removed while connected stays removed when stop()/start() creates a
+// fresh client and replays the local subscription list.
+TEST(MqttHelperUnsubscribe, RemovedTopicIsNotReplayedAfterStopStart) {
+    multi_connection_broker broker;
+    auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", broker.port(),
+                                                          "unsubscribe-stop-start");
+    helper->set_log_handler([](const litemqtt::log_record&) {});
+    helper->set_reconnect_config(0, 10);
+    helper->subscribe("remove/on-restart", 1);
+    helper->subscribe("keep/on-restart", 1);
+    helper->start();
+    ASSERT_TRUE(wait_for([&helper]() { return helper->is_connected(); }, 3000));
+
+    std::atomic<bool> removed{false};
+    std::atomic<bool> unsubscribe_success{false};
+    helper->unsubscribe("remove/on-restart", [&](bool success, std::string) {
+        unsubscribe_success.store(success);
+        removed.store(true);
+    });
+    ASSERT_TRUE(wait_for([&removed]() { return removed.load(); }, 3000))
+        << "the removal was not acknowledged";
+    ASSERT_TRUE(unsubscribe_success.load());
+
+    helper->stop();
+    helper->start();
+    ASSERT_TRUE(wait_for([&helper]() { return helper->connected_count() >= 2; }, 3000));
+    ASSERT_TRUE(wait_for([&broker]() {
+        const auto frames = broker.received_for(2);
+        return std::any_of(frames.begin(), frames.end(), [](const std::vector<uint8_t>& frame) {
+            return !frame.empty() && (frame[0] >> 4) == 8;
+        });
+    }, 3000)) << "the retained subscription was not replayed on the second session";
+
+    std::vector<std::string> replayed;
+    for (const auto& frame : broker.received_for(2)) {
+        if (!frame.empty() && (frame[0] >> 4) == 8) {
+            replayed.push_back(mqtt_filter(frame));
+        }
+    }
+    ASSERT_EQ(replayed.size(), 1u);
+    EXPECT_EQ(replayed[0], "keep/on-restart");
+    helper->stop();
+}
+
+// Operations on one topic retain their call order: subscribe, unsubscribe,
+// subscribe. The final subscribe is also the one carried into the next session.
+TEST(MqttHelperUnsubscribe, OnlineSubscribeUnsubscribeSubscribePreservesOrder) {
+    multi_connection_broker broker;
+    auto helper = std::make_shared<litemqtt::mqtt_helper>("127.0.0.1", broker.port(),
+                                                          "unsubscribe-operation-order");
+    helper->set_log_handler([](const litemqtt::log_record&) {});
+    helper->set_reconnect_config(0, 10);
+    helper->start();
+    ASSERT_TRUE(wait_for([&helper]() { return helper->is_connected(); }, 3000));
+
+    std::atomic<bool> unsubscribe_ok{false};
+    helper->subscribe("sequence/topic", 1);
+    helper->unsubscribe("sequence/topic", [&](bool ok, std::string) {
+        unsubscribe_ok.store(ok);
+    });
+    helper->subscribe("sequence/topic", 1);
+
+    ASSERT_TRUE(wait_for([&]() {
+        return unsubscribe_ok.load() && broker.received_for(1).size() >= 4;
+    }, 3000)) << "the ordered subscribe/unsubscribe/subscribe sequence did not complete";
+
+    std::vector<std::pair<uint8_t, std::string>> operations;
+    for (const auto& frame : broker.received_for(1)) {
+        if (frame.empty()) continue;
+        const uint8_t type = static_cast<uint8_t>(frame[0] >> 4);
+        if (type == 8 || type == 10) {
+            operations.emplace_back(type, mqtt_filter(frame));
+        }
+    }
+    ASSERT_EQ(operations.size(), 3u);
+    EXPECT_EQ(operations[0].first, 8);
+    EXPECT_EQ(operations[1].first, 10);
+    EXPECT_EQ(operations[2].first, 8);
+    for (const auto& operation : operations) {
+        EXPECT_EQ(operation.second, "sequence/topic");
+    }
+
+    helper->stop();
+    helper->start();
+    ASSERT_TRUE(wait_for([&helper]() { return helper->connected_count() >= 2; }, 3000));
+    ASSERT_TRUE(wait_for([&broker]() {
+        const auto frames = broker.received_for(2);
+        return std::any_of(frames.begin(), frames.end(), [](const std::vector<uint8_t>& frame) {
+            return !frame.empty() && (frame[0] >> 4) == 8;
+        });
+    }, 3000)) << "the final subscribe was not retained for replay";
+
+    std::vector<std::string> replayed;
+    for (const auto& frame : broker.received_for(2)) {
+        if (!frame.empty() && (frame[0] >> 4) == 8) {
+            replayed.push_back(mqtt_filter(frame));
+        }
+    }
+    ASSERT_EQ(replayed.size(), 1u);
+    EXPECT_EQ(replayed[0], "sequence/topic");
+    helper->stop();
 }

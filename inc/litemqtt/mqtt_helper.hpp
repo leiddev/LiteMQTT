@@ -1,6 +1,7 @@
 #ifndef LITEMQTT_HELPER_HPP
 #define LITEMQTT_HELPER_HPP
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -108,6 +109,11 @@ public:
     void subscribe(const std::string& topic, uint8_t qos = 1);
     void subscribe(const std::string& topic, uint8_t qos,
                    std::function<void(bool success, std::string topic, uint8_t qos)> callback);
+    /// Removes every exact match from the reconnect subscription list, even
+    /// while offline. Online success is reported only after UNSUBACK. Offline
+    /// calls report false synchronously; no broker-side unsubscribe is queued
+    /// (persistent sessions may still retain that subscription).
+    void unsubscribe(const std::string& topic, unsubscribe_cb callback = nullptr);
     void publish(const std::string& topic, const std::string& payload,
                  uint8_t qos = 0);
     void publish(const std::string& topic, const std::string& payload,
@@ -318,10 +324,9 @@ inline void mqtt_helper::subscribe(const std::string& topic, uint8_t qos) {
 inline void mqtt_helper::subscribe(
     const std::string& topic, uint8_t qos,
     std::function<void(bool success, std::string topic, uint8_t qos)> callback) {
-    {
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        subscribes_.emplace_back(topic, qos);
-    }
+    // Keep list changes and queued requests ordered with unsubscribe/replay.
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    subscribes_.emplace_back(topic, qos);
 
     if (!is_connected()) {
         return;
@@ -332,6 +337,25 @@ inline void mqtt_helper::subscribe(
         return;
     }
     client->async_subscribe(topic, qos, std::move(callback));
+}
+
+inline void mqtt_helper::unsubscribe(const std::string& topic, unsubscribe_cb callback) {
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        subscribes_.erase(std::remove_if(subscribes_.begin(), subscribes_.end(),
+            [&topic](const std::pair<std::string, uint8_t>& entry) {
+                return entry.first == topic;
+            }), subscribes_.end());
+
+        auto client = lock_client();
+        if (!user_stopped_.load() && client &&
+            client->state() == connection_state::connected) {
+            client->async_unsubscribe(topic, std::move(callback));
+            return;
+        }
+    }
+    // User callbacks may call subscribe/unsubscribe, so release the lock first.
+    if (callback) callback(false, topic);
 }
 
 inline void mqtt_helper::publish(const std::string& topic,

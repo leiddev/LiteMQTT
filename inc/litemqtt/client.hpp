@@ -29,6 +29,7 @@ using close_cb = std::function<void()>;
 /// session that is torn down through this callback only.  Runs on the io thread.
 using disconnected_cb = std::function<void()>;
 using subscribe_cb = std::function<void(bool success, std::string topic, uint8_t qos_granted)>;
+using unsubscribe_cb = std::function<void(bool success, std::string topic)>;
 using publish_cb = std::function<void(bool success, std::string topic, uint8_t qos, uint16_t packet_id)>;
 
 class mqtt_client : public std::enable_shared_from_this<mqtt_client> {
@@ -75,6 +76,12 @@ public:
                        uint8_t qos = 0, publish_cb callback = nullptr);
     void async_subscribe(const std::string& topic, uint8_t qos = 0, subscribe_cb callback = nullptr);
 
+    /// Completes once on UNSUBACK, or fails on write/session failure. Runs on io,
+    /// except close() after io stops completes pending callbacks synchronously.
+    /// An omitted callback uses the handler installed with on_unsubscribe().
+    void async_unsubscribe(const std::string& topic, unsubscribe_cb callback = nullptr);
+    void on_unsubscribe(unsubscribe_cb callback);
+
     void on_connect(connect_cb callback);
     void on_message(message_cb callback);
     void on_close(close_cb callback);
@@ -120,6 +127,10 @@ private:
     void async_publish_impl(const std::string& topic, const std::string& payload,
                             uint8_t qos, publish_cb callback);
     void async_subscribe_impl(const std::string& topic, uint8_t qos, subscribe_cb callback);
+    void async_unsubscribe_impl(const std::string& topic, unsubscribe_cb callback);
+    void handle_unsuback(const std::vector<uint8_t>& data);
+    void finish_unsubscribe(uint16_t packet_id, bool success);
+    void fail_pending_unsubscribes();
     void send_pubrel(uint16_t packet_id);
     void arm_publish_retry_timer(uint16_t packet_id);
     void arm_pubrec_retry_timer(uint16_t packet_id);
@@ -211,6 +222,7 @@ private:
     close_cb on_close_cb_;
     disconnected_cb on_disconnected_cb_;
     subscribe_cb on_subscribe_cb_;
+    unsubscribe_cb on_unsubscribe_cb_;
     publish_cb on_publish_cb_;
 
     struct pending_publish {
@@ -234,6 +246,7 @@ private:
     };
 
     std::map<uint16_t, std::pair<std::vector<std::pair<std::string, uint8_t>>, subscribe_cb>> pending_subscribes_;
+    std::map<uint16_t, std::pair<std::string, unsubscribe_cb>> pending_unsubscribes_;
     std::map<uint16_t, pending_publish> pending_publishes_;
     std::map<uint16_t, pending_pubrec> pending_pubrecs_;
 
@@ -440,6 +453,9 @@ inline void mqtt_client::handle_packet(const std::vector<uint8_t>& data) {
             break;
         case packet_type::suback:
             handle_suback(data);
+            break;
+        case packet_type::unsuback:
+            handle_unsuback(data);
             break;
         case packet_type::puback:
             handle_puback(data);
@@ -734,6 +750,7 @@ inline void mqtt_client::async_disconnect(std::function<void()> on_closed) {
                 << "client async_disconnect requested; DISCONNECT sent";
         }
         conn_->close();
+        fail_pending_unsubscribes();
         if (on_closed) {
             on_closed();
         }
@@ -746,6 +763,7 @@ inline void mqtt_client::close() {
     }
     intentional_close_ = true;
     conn_->close();
+    fail_pending_unsubscribes();
 }
 
 inline void mqtt_client::async_publish(const std::string& topic, const std::string& payload,
@@ -888,6 +906,75 @@ inline void mqtt_client::async_subscribe_impl(const std::string& topic, uint8_t 
         });
 }
 
+inline void mqtt_client::async_unsubscribe(const std::string& topic, unsubscribe_cb callback) {
+    auto self = shared_from_this();
+    asio::post(io_, [self, topic, callback = std::move(callback)]() mutable {
+        self->async_unsubscribe_impl(topic, std::move(callback));
+    });
+}
+
+inline void mqtt_client::async_unsubscribe_impl(const std::string& topic, unsubscribe_cb callback) {
+    if (!callback) callback = on_unsubscribe_cb_;
+    if (topic.empty() || topic.size() > 65535 || closed_ ||
+        conn_->state() != connection_state::connected) {
+        if (callback) callback(false, topic);
+        return;
+    }
+
+    const uint16_t packet_id = acquire_packet_id();
+    if (packet_id == 0) {
+        if (callback) callback(false, topic);
+        return;
+    }
+
+    unsubscribe_packet pkt;
+    pkt.packet_id = packet_id;
+    pkt.topic_filters.push_back(topic);
+    pending_unsubscribes_[packet_id] = {topic, std::move(callback)};
+    auto self = shared_from_this();
+    conn_->async_write_packet(pkt.serialize(), [self, packet_id](const asio::error_code& ec) {
+        // A successful write is not a broker acknowledgement.
+        if (ec) self->finish_unsubscribe(packet_id, false);
+    });
+}
+
+inline void mqtt_client::handle_unsuback(const std::vector<uint8_t>& data) {
+    unsuback_packet pkt;
+    // The shared parser checks framing; UNSUBACK additionally requires zero
+    // flags, a two-byte body, and a nonzero packet identifier.
+    buffer_reader reader(data);
+    uint8_t header = 0;
+    std::size_t remaining = 0;
+    if (!unsuback_packet::parse(data, pkt) ||
+        !reader.read_uint8(header) || header != 0xB0 ||
+        !reader.read_remaining_length(remaining) || remaining != 2 || pkt.packet_id == 0) {
+        notify_closed_once("malformed UNSUBACK");
+        return;
+    }
+    finish_unsubscribe(pkt.packet_id, true);
+}
+
+inline void mqtt_client::finish_unsubscribe(uint16_t packet_id, bool success) {
+    auto it = pending_unsubscribes_.find(packet_id);
+    if (it == pending_unsubscribes_.end()) return;
+    auto entry = std::move(it->second);
+    pending_unsubscribes_.erase(it);
+    if (entry.second) entry.second(success, std::move(entry.first));
+}
+
+inline void mqtt_client::fail_pending_unsubscribes() {
+    // Detach all entries before user code can re-enter packet handling or close().
+    decltype(pending_unsubscribes_) pending;
+    pending.swap(pending_unsubscribes_);
+    for (auto& kv : pending) {
+        if (kv.second.second) kv.second.second(false, std::move(kv.second.first));
+    }
+}
+
+inline void mqtt_client::on_unsubscribe(unsubscribe_cb callback) {
+    on_unsubscribe_cb_ = std::move(callback);
+}
+
 inline void mqtt_client::on_connect(connect_cb callback) { on_connect_cb_ = std::move(callback); }
 inline void mqtt_client::on_message(message_cb callback) { on_message_cb_ = std::move(callback); }
 inline void mqtt_client::on_close(close_cb callback) { on_close_cb_ = std::move(callback); }
@@ -918,6 +1005,7 @@ inline uint16_t mqtt_client::acquire_packet_id() {
 
         if (!pending_publishes_.count(candidate) &&
             !pending_subscribes_.count(candidate) &&
+            !pending_unsubscribes_.count(candidate) &&
             !pending_pubrecs_.count(candidate)) {
             return candidate;
         }
@@ -1120,6 +1208,8 @@ inline void mqtt_client::cleanup_session() {
         asio::error_code ignored;
         connect_timer_->cancel(ignored);
     }
+
+    fail_pending_unsubscribes();
 
     for (auto& kv : pending_publishes_) {
         if (kv.second.callback) {

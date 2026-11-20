@@ -387,6 +387,24 @@ After giving up, `is_reconnect_armed()` returns `false` and `rearm_reconnect()`
 puts the helper back to work (returns `false` if it is not running, in which case
 `start()` is what you need). Both are safe to call from any thread.
 
+#### Unsubscribing
+
+Call `client->async_unsubscribe(topic, callback)` or
+`helper->unsubscribe(topic, callback)`. The optional callback has signature
+`void(bool success, std::string topic)`; success means the broker sent UNSUBACK,
+not merely that the request was written. A failed write or a connection lost
+while waiting for UNSUBACK reports failure. Client callbacks run on its io thread,
+except that `close()` after the io loop stops fails pending requests on the
+calling thread.
+
+The helper immediately removes all exact matches of the topic filter from its
+reconnect subscription list. For example, unsubscribing `sensors/+` does not
+remove a separate `sensors/temperature` subscription. While offline (including
+before `start()` or after `stop()`), the helper still removes the local entries
+and invokes the callback synchronously with `false`. It does not queue an
+UNSUBSCRIBE for the next connection: with `clean_session=false`, the broker may
+retain the old subscription, so retry while connected to remove it there.
+
 #### Connection state callbacks
 
 The helper owns `mqtt_client::on_connect` and `on_close` for its reconnection
