@@ -162,6 +162,14 @@ if(LITEMQTT_BUILD_TESTS)
         litemqtt_add_test(log_test)
         litemqtt_add_test(connection_test)
         litemqtt_add_test(helper_test)
+
+        # Links two translation units that both include the public headers, which
+        # is what a consumer does and what the one-.cc-per-test targets above do
+        # not: a definition left in a header only fails once they are combined.
+        add_executable(link_test test/link_test.cc test/link_test_other.cc)
+        target_link_libraries(link_test PRIVATE
+            LiteMQTT::litemqtt ${LITEMQTT_GTEST_LIBS} litemqtt_build_flags)
+        add_test(NAME link_test COMMAND link_test)
     elseif(LITEMQTT_REQUIRE_TESTS)
         message(FATAL_ERROR
             "GoogleTest not found and LITEMQTT_REQUIRE_TESTS is ON. "

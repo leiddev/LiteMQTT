@@ -194,7 +194,12 @@ TEST(ConnectionWriteQueue, ZeroDisablesTheBound) {
 TEST(ConnectionWriteQueue, DefaultsToTheNamedConstant) {
     asio::io_context io;
     auto conn = std::make_shared<litemqtt::connection>(io);
-    EXPECT_EQ(conn->max_write_queue(), litemqtt::connection::kDefaultMaxWriteQueue);
+    // Cast, do not bind: a reference to the constant is an odr-use, and C++14
+    // would then need an out-of-class definition in the header -- one copy per
+    // translation unit, which gcc emits as a strong symbol and ld rejects on
+    // the second one.
+    EXPECT_EQ(conn->max_write_queue(),
+              std::size_t(litemqtt::connection::kDefaultMaxWriteQueue));
     EXPECT_EQ(conn->max_write_queue(), 1024u);
 }
 

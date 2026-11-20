@@ -410,7 +410,8 @@ TEST(MqttClientGuards, SubscribeRejectsInvalidQos) {
 TEST(MqttClientPacketSize, DefaultsToOneMiB) {
     asio::io_context io;
     auto client = make_test_client(io);
-    EXPECT_EQ(client->max_packet_size(), connection::kDefaultMaxPacketSize);
+    EXPECT_EQ(client->max_packet_size(),
+              std::size_t(connection::kDefaultMaxPacketSize));
     EXPECT_EQ(client->max_packet_size(), 1024u * 1024u);
 }
 
@@ -432,7 +433,8 @@ TEST(MqttClientWriteQueue, DefaultsAndForwards) {
     asio::io_context io;
     auto client = make_test_client(io);
 
-    EXPECT_EQ(client->max_write_queue(), connection::kDefaultMaxWriteQueue);
+    EXPECT_EQ(client->max_write_queue(),
+              std::size_t(connection::kDefaultMaxWriteQueue));
 
     client->set_max_write_queue(64);
     EXPECT_EQ(client->max_write_queue(), 64u);

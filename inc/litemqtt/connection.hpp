@@ -142,11 +142,6 @@ private:
     bool closed_ = false;
 };
 
-// C++14 requires an out-of-class definition when a static constexpr data member
-// is odr-used (for example, when passed to EXPECT_EQ as a reference).
-constexpr std::size_t connection::kDefaultMaxPacketSize;
-constexpr std::size_t connection::kDefaultMaxWriteQueue;
-
 inline connection::connection(asio::io_context& io)
     : io_(io), socket_(io), resolver_(io) {
 }

@@ -9,6 +9,17 @@ replacing them.
 
 ## [Unreleased]
 
+### Fixed
+
+- **1.3.0 did not link in a program with more than one translation unit.** It
+  defined `connection::kDefaultMaxPacketSize` and `kDefaultMaxWriteQueue` out of
+  class inside the header to satisfy a C++14 odr-use in the tests. gcc emits such
+  a definition as a strong symbol, so every object file that included the header
+  got its own copy and `ld` rejected the second with "multiple definition". The
+  definition is gone again and the tests take the constants by value instead;
+  `link_test` now links two units that include the public headers, which is what
+  the library's own one-.cc-per-target tests could not see.
+
 ## [1.3.0] - 2026-11-20
 
 ### Added
